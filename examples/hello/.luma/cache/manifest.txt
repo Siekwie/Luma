@@ -1,16 +1,14 @@
-[task:compile:hello:src/main.cpp]
-cache_key=e052734a053f1c0b
-input=src/main.cpp|0ab3818e46cda2ee31fc6f130fdafdbd4b60809a33b3d38190de59424d45d7f6
-
 [task:compile:core:src/core/greeting.cpp]
 cache_key=3d75f92286eeab51
 input=src/core/greeting.cpp|114fdb778c482539bafd2d0439b64aecb821a3a21efd1ecf8dd7b0982f76d1a5
 
+[task:compile:hello:src/main.cpp]
+cache_key=e052734a053f1c0b
+input=src/main.cpp|0ab3818e46cda2ee31fc6f130fdafdbd4b60809a33b3d38190de59424d45d7f6
+
 [task:link:core]
-cache_key=b4c0b11be1bed0c0
-input=build/obj/core/greeting.o|901029ebdd98193db7294a8f909b1dda0034b997b9584f531be601826cce9af2
+cache_key=2807df12d7640ef1
 
 [task:link:hello]
-cache_key=6993dcc7f8e2c839
-input=build/obj/hello/main.o|788390329ef7ca1a56921052b75a4b3bb32af797c15c17096c2a5100f7034da3
+cache_key=7bce1a50fe92e34
 

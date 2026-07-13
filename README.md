@@ -50,7 +50,7 @@ profile "release" {}
 ## Commands
 
 ```bash
-luma build [targets...] [--profile debug|release] [--dry-run] [--verbose]
+luma build [targets...] [--profile debug|release] [--dry-run] [--verbose] [-j N]
 luma clean
 luma graph --format dot
 luma explain <target>
@@ -73,6 +73,7 @@ Lua configuration  →  Build graph  →  Execution engine
 - C/C++ executables and static libraries
 - Auto-detected toolchains (clang++, g++, MSVC `cl`)
 - Incremental builds with SHA-256 input hashing (Windows) and cache keys
+- Parallel execution (`-j N`, defaults to CPU core count) with DAG-aware scheduling
 - `explain` shows why a target would rebuild
 - `inspect` shows target configuration
 - `graph` exports the task DAG as Graphviz DOT
