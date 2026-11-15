@@ -579,7 +579,15 @@ int cmd_init(const ParsedArgs& args) {
         "--\n"
         "-- profile(\"debug\", { defines = { \"MYAPP_DEBUG\" } })\n"
         "-- profile(\"release\", { cxxflags = { \"-march=native\" } })\n"
-        "-- profile(\"asan\", { cxxflags = { \"-O1\", \"-g\", \"-fsanitize=address\" }, linkflags = { \"-fsanitize=address\" } })\n";
+        "--\n"
+        "-- A sanitizer build: debug plus AddressSanitizer/UBSan (luma build --profile asan):\n"
+        "-- profile(\"asan\", { inherit = \"debug\", cxxflags = { \"-fsanitize=address,undefined\" }, linkflags = { \"-fsanitize=address,undefined\" } })\n"
+        "\n"
+        "-- Tests: executables marked test = true; `luma test` builds and runs them.\n"
+        "-- target(\"" + name + "_test\", {\n"
+        "--     sources = { \"tests/" + name + "_test.cpp\" },\n"
+        "--     test = true,\n"
+        "-- })\n";
 
     const std::string main_cpp =
         "#include <iostream>\n"
