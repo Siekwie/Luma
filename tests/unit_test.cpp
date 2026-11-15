@@ -1,0 +1,296 @@
+#include "luma/config/graph_builder.hpp"
+#include "luma/executor/depfile.hpp"
+#include "luma/filesystem/glob.hpp"
+#include "luma/filesystem/path_util.hpp"
+#include "luma/filesystem/sha256.hpp"
+#include "luma/util/json.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+
+namespace fs = luma::fs;
+using namespace luma;
+
+static int failures = 0;
+
+#define CHECK(cond)                                                                       \
+    do {                                                                                  \
+        if (!(cond)) {                                                                    \
+            std::cerr << "FAIL: " << #cond << " (" << __FILE__ << ':' << __LINE__ << ")\n"; \
+            ++failures;                                                                   \
+        }                                                                                 \
+    } while (0)
+
+#define CHECK_EQ(a, b)                                                                     \
+    do {                                                                                   \
+        const auto& va = (a);                                                              \
+        const auto& vb = (b);                                                              \
+        if (!(va == vb)) {                                                                 \
+            std::cerr << "FAIL: " << #a << " == " << #b << "\n  got:      " << va          \
+                      << "\n  expected: " << vb << " (" << __FILE__ << ':' << __LINE__ << ")\n"; \
+            ++failures;                                                                    \
+        }                                                                                  \
+    } while (0)
+
+static void test_sha256() {
+    CHECK_EQ(fs::sha256_hex(""), std::string("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    CHECK_EQ(fs::sha256_hex("abc"), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    CHECK_EQ(
+        fs::sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        std::string("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+
+    // One million 'a', fed in uneven chunks to exercise buffering.
+    fs::Sha256 hasher;
+    const std::string chunk(997, 'a');
+    std::size_t remaining = 1000000;
+    while (remaining > 0) {
+        const std::size_t take = std::min(remaining, chunk.size());
+        hasher.update(chunk.data(), take);
+        remaining -= take;
+    }
+    CHECK_EQ(hasher.finish_hex(), std::string("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+}
+
+static void test_json() {
+    CHECK_EQ(util::json_quote("plain"), std::string("\"plain\""));
+    CHECK_EQ(util::json_quote("a\"b\\c"), std::string("\"a\\\"b\\\\c\""));
+    CHECK_EQ(util::json_quote("line\nnext\ttab\r"), std::string("\"line\\nnext\\ttab\\r\""));
+    CHECK_EQ(util::json_quote(std::string("\x01", 1)), std::string("\"\\u0001\""));
+    CHECK_EQ(util::json_quote("C:\\path\\x"), std::string("\"C:\\\\path\\\\x\""));
+    CHECK_EQ(util::json_quote("caf\xc3\xa9"), std::string("\"caf\xc3\xa9\""));
+    CHECK_EQ(util::json_quote("bad\xff"), std::string("\"bad\\ufffd\""));
+
+    util::JsonWriter writer;
+    writer.begin_object();
+    writer.field("name", "x");
+    writer.key("list").string_array({"a", "b"});
+    writer.key("empty").string_array({});
+    writer.key("nested").begin_object().field("flag", true).end_object();
+    writer.end_object();
+    CHECK_EQ(writer.str(), std::string(R"({"name":"x","list":["a","b"],"empty":[],"nested":{"flag":true}})"));
+
+    util::JsonWriter pretty(2);
+    pretty.begin_array().begin_object().field("k", "v").end_object().end_array();
+    CHECK_EQ(pretty.str(), std::string("[\n  {\n    \"k\": \"v\"\n  }\n]"));
+}
+
+static void test_gcc_depfile() {
+    const auto deps = executor::parse_gcc_depfile(
+        "/b/obj/main.cpp.o: /src/main.cpp /src/inc/a.hpp \\\n"
+        "  /src/inc/with\\ space.hpp /src/inc/dollar$$.hpp\n");
+    CHECK_EQ(deps.size(), std::size_t{4});
+    if (deps.size() == 4) {
+        CHECK_EQ(deps[0], std::string("/src/main.cpp"));
+        CHECK_EQ(deps[1], std::string("/src/inc/a.hpp"));
+        CHECK_EQ(deps[2], std::string("/src/inc/with space.hpp"));
+        CHECK_EQ(deps[3], std::string("/src/inc/dollar$.hpp"));
+    }
+
+    const auto windows = executor::parse_gcc_depfile(
+        "C:/b/obj/main.cpp.o: C:/src/main.cpp \\\r\n C:/src/a.hpp\r\n");
+    CHECK_EQ(windows.size(), std::size_t{2});
+    if (windows.size() == 2) {
+        CHECK_EQ(windows[0], std::string("C:/src/main.cpp"));
+        CHECK_EQ(windows[1], std::string("C:/src/a.hpp"));
+    }
+}
+
+static void test_msvc_scan() {
+    const std::string output =
+        "main.cpp\r\n"
+        "Note: including file: C:\\proj\\include\\hello.hpp\r\n"
+        "Note: including file:  C:\\Program Files\\Microsoft Visual Studio\\VC\\include\\string\r\n"
+        "C:\\proj\\src\\main.cpp(3): error C2065: 'x': undeclared identifier\r\n";
+    const auto scan = executor::scan_msvc_output(output, "main.cpp");
+    CHECK_EQ(scan.includes.size(), std::size_t{1});
+    if (!scan.includes.empty()) {
+        CHECK_EQ(scan.includes[0], std::string("C:/proj/include/hello.hpp"));
+    }
+    CHECK_EQ(scan.output, std::string("C:\\proj\\src\\main.cpp(3): error C2065: 'x': undeclared identifier\n"));
+}
+
+static void test_paths() {
+    CHECK_EQ(fs::join("/root", "src/a.cpp"), std::string("/root/src/a.cpp"));
+    CHECK_EQ(fs::join("/root/.", "./src/../include/"), std::string("/root/include"));
+    CHECK_EQ(fs::join("/root", "/abs/x"), std::string("/abs/x"));
+    CHECK_EQ(fs::join("/root", "C:/abs/x"), std::string("C:/abs/x"));
+    CHECK(fs::is_absolute("C:\\x"));
+    CHECK(!fs::is_absolute("x/y"));
+}
+
+/// Temporary project directory, removed on destruction.
+struct TempProject {
+    std::filesystem::path root;
+
+    TempProject() {
+        root = std::filesystem::temp_directory_path() /
+               ("luma_unit_" + std::to_string(std::hash<std::string>{}(std::to_string(
+                                   std::chrono::steady_clock::now().time_since_epoch().count()))));
+        std::filesystem::create_directories(root);
+    }
+    ~TempProject() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    void write(const std::string& rel, const std::string& content = "") const {
+        const auto path = root / rel;
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path) << content;
+    }
+    Path path() const { return fs::lexically_normal(root.generic_string()); }
+};
+
+static void test_glob() {
+    TempProject project;
+    project.write("src/main.cpp");
+    project.write("src/core/a.cpp");
+    project.write("src/core/deep/b.cpp");
+    project.write("src/core/deep/b.hpp");
+    project.write("other/c.cpp");
+
+    const auto all = fs::glob(project.path(), "src/**/*.cpp");
+    CHECK_EQ(all.size(), std::size_t{3});
+    CHECK(std::find(all.begin(), all.end(), "src/main.cpp") != all.end());
+    CHECK(std::find(all.begin(), all.end(), "src/core/deep/b.cpp") != all.end());
+
+    const auto direct = fs::glob(project.path(), "src/*.cpp");
+    CHECK_EQ(direct.size(), std::size_t{1});
+
+    const auto core = fs::glob(project.path(), "src/core/**/*.cpp");
+    CHECK_EQ(core.size(), std::size_t{2});
+
+    const auto anywhere = fs::glob(project.path(), "**/*.cpp");
+    CHECK_EQ(anywhere.size(), std::size_t{4});
+
+    const auto literal = fs::glob(project.path(), "other/c.cpp");
+    CHECK_EQ(literal.size(), std::size_t{1});
+}
+
+static const graph::Task* find_by_prefix(const config::BuildPlan& plan, const std::string& id) {
+    return plan.graph.find_task(graph::TaskId{id});
+}
+
+static void test_build_plan_languages_and_outputs() {
+    TempProject project;
+    project.write("src/main.cpp");
+    project.write("src/legacy.c");
+    project.write("lib/shared.cpp");
+    project.write("include/x.hpp");
+    project.write("src/local.hpp");
+
+    config::ProjectConfig cfg;
+    cfg.name = "t";
+    cfg.root = project.path();
+    cfg.profile = "debug";
+    cfg.toolchains["gnu"] = config::ToolchainDef{
+        .name = "gnu",
+        .style = config::ToolchainStyle::Gnu,
+        .cc = "my-cc",
+        .cxx = "my-c++",
+        .linker = "",
+        .archiver = "ar",
+        .languages = {},
+    };
+    cfg.active_toolchain = "gnu";
+    cfg.profiles["debug"] = config::ProfileDef{
+        .name = "debug",
+        .defines = {"DEBUG"},
+        .cflags = {"-std=c11"},
+        .cxxflags = {"-std=c++20"},
+        .linkflags = {},
+        .lto = false,
+    };
+
+    config::TargetDef shared;
+    shared.name = "shared";
+    shared.kind = config::TargetKind::SharedLibrary;
+    shared.sources = {"lib/shared.cpp"};
+    shared.include_dirs = {"include"};
+    cfg.targets["shared"] = shared;
+
+    config::TargetDef app;
+    app.name = "app";
+    app.kind = config::TargetKind::Executable;
+    app.source_patterns = {"src/**/*"};
+    app.dependencies = {"shared"};
+    cfg.targets["app"] = app;
+
+    config::BuildPlan plan;
+    const auto err = config::build_plan(cfg, plan);
+    CHECK(!err.has_value());
+    if (err) {
+        std::cerr << err->message << '\n';
+        return;
+    }
+
+    const graph::Task* c_task = find_by_prefix(plan, "compile:app:src/legacy.c");
+    const graph::Task* cxx_task = find_by_prefix(plan, "compile:app:src/main.cpp");
+    CHECK(c_task && cxx_task);
+    if (c_task && cxx_task) {
+        CHECK_EQ(c_task->command.front(), std::string("my-cc"));
+        CHECK(std::find(c_task->command.begin(), c_task->command.end(), "-std=c11") != c_task->command.end());
+        CHECK(std::find(c_task->command.begin(), c_task->command.end(), "-std=c++20") == c_task->command.end());
+        CHECK_EQ(c_task->metadata.at("language"), std::string("c"));
+        CHECK_EQ(cxx_task->command.front(), std::string("my-c++"));
+        CHECK_EQ(cxx_task->outputs.front(), std::string("build/obj/app/src/main.cpp.o"));
+        // Dependency include directories propagate.
+        CHECK(std::find(cxx_task->command.begin(), cxx_task->command.end(), "-I" + project.path() + "/include") !=
+              cxx_task->command.end());
+    }
+
+    // Headers matched by the glob are not compiled.
+    CHECK(find_by_prefix(plan, "compile:app:src/local.hpp") == nullptr);
+
+    const graph::Task* link_app = find_by_prefix(plan, "link:app");
+    const graph::Task* link_shared = find_by_prefix(plan, "link:shared");
+    CHECK(link_app && link_shared);
+    if (link_app && link_shared) {
+#ifdef _WIN32
+        CHECK_EQ(link_app->outputs.front(), std::string("build/app.exe"));
+        CHECK_EQ(link_shared->outputs.front(), std::string("build/libshared.dll"));
+#elif defined(__APPLE__)
+        CHECK_EQ(link_app->outputs.front(), std::string("build/app"));
+        CHECK_EQ(link_shared->outputs.front(), std::string("build/libshared.dylib"));
+#else
+        CHECK_EQ(link_app->outputs.front(), std::string("build/app"));
+        CHECK_EQ(link_shared->outputs.front(), std::string("build/libshared.so"));
+#endif
+        CHECK(std::find(link_shared->command.begin(), link_shared->command.end(), "-shared") !=
+              link_shared->command.end());
+        CHECK(std::find(link_app->dependencies.begin(), link_app->dependencies.end(),
+                        graph::TaskId{"link:shared"}) != link_app->dependencies.end());
+    }
+
+    CHECK_EQ(plan.targets.size(), std::size_t{2});
+    if (plan.targets.size() == 2) {
+        CHECK_EQ(plan.targets[0].name, std::string("app"));
+        CHECK_EQ(plan.targets[0].sources.size(), std::size_t{3});
+    }
+
+    // Restricting the plan pulls in dependencies.
+    config::BuildPlan partial;
+    CHECK(!config::build_plan(cfg, partial, {"app"}).has_value());
+    CHECK(partial.graph.find_task(graph::TaskId{"link:shared"}) != nullptr);
+    CHECK(config::build_plan(cfg, partial, {"nope"}).has_value());
+}
+
+int main() {
+    test_sha256();
+    test_json();
+    test_gcc_depfile();
+    test_msvc_scan();
+    test_paths();
+    test_glob();
+    test_build_plan_languages_and_outputs();
+
+    if (failures != 0) {
+        std::cerr << failures << " check(s) failed\n";
+        return 1;
+    }
+    std::cout << "all unit tests passed\n";
+    return 0;
+}
