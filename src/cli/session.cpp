@@ -95,7 +95,16 @@ void inspect_target(const config::ProjectConfig& config, const std::string& targ
     std::cout << "Language: " << config::canonical_language(target->language) << '\n';
 
     std::cout << "Sources: " << target->sources.size() + target->source_patterns.size() << " pattern(s)\n";
-    std::cout << "Include directories: " << target->include_dirs.size() << '\n';
+    std::cout << "Include directories: " << target->include_dirs.size() + target->public_include_dirs.size()
+              << '\n';
+    std::cout << "Public defines:";
+    if (target->public_defines.empty()) {
+        std::cout << " none";
+    }
+    for (const auto& define : target->public_defines) {
+        std::cout << ' ' << define;
+    }
+    std::cout << '\n';
     std::cout << "Dependencies:";
     if (target->dependencies.empty()) {
         std::cout << " none\n";

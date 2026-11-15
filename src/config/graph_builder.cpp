@@ -498,12 +498,25 @@ std::optional<BuildPlanError> build_plan(
     for (const auto& target_name : target_names) {
         const TargetDef& target = *find_target(config, target_name);
 
+        // Usage requirements of dependencies, in link order (dependents
+        // before their dependencies), through shared libraries too: their
+        // headers are compiled into this target.
+        const auto deps_in_order = transitive_dependencies(config, target.name, true);
+
+        // Defines: profile, own, own public, then dependencies' public ones;
+        // each define appears once (first occurrence wins).
         std::vector<std::string> defines;
         if (profile) {
-            append(defines, profile->defines);
+            append_unique(defines, profile->defines);
         }
-        append(defines, target.defines);
+        append_unique(defines, target.defines);
+        append_unique(defines, target.public_defines);
+        for (const auto& dep_name : deps_in_order) {
+            append_unique(defines, find_target(config, dep_name)->public_defines);
+        }
 
+        // Flags keep their order and are not deduplicated (flags may come in
+        // pairs such as "-include x.h"); dependencies' public flags go last.
         std::vector<std::string> cflags;
         std::vector<std::string> cxxflags;
         std::vector<std::string> linkflags;
@@ -515,6 +528,13 @@ std::optional<BuildPlanError> build_plan(
         append(cflags, target.cflags);
         append(cxxflags, target.cxxflags);
         append(linkflags, target.linkflags);
+        append(cflags, target.public_cflags);
+        append(cxxflags, target.public_cxxflags);
+        for (const auto& dep_name : deps_in_order) {
+            const TargetDef& dep = *find_target(config, dep_name);
+            append(cflags, dep.public_cflags);
+            append(cxxflags, dep.public_cxxflags);
+        }
 
         if (target.kind == TargetKind::SharedLibrary && toolchain.style == ToolchainStyle::Gnu &&
             !is_windows_host()) {
@@ -527,10 +547,15 @@ std::optional<BuildPlanError> build_plan(
             return BuildPlanError{"target '" + target.name + "' has no sources"};
         }
 
+        // Include directories: own (include_dirs and public_include_dirs),
+        // then each dependency's. Both kinds are exported to dependents.
         std::vector<Path> include_dirs;
         append_unique(include_dirs, target.include_dirs);
-        for (const auto& dep_name : transitive_dependencies(config, target.name, true)) {
-            append_unique(include_dirs, find_target(config, dep_name)->include_dirs);
+        append_unique(include_dirs, target.public_include_dirs);
+        for (const auto& dep_name : deps_in_order) {
+            const TargetDef& dep = *find_target(config, dep_name);
+            append_unique(include_dirs, dep.include_dirs);
+            append_unique(include_dirs, dep.public_include_dirs);
         }
 
         std::vector<graph::TaskId> compile_tasks;

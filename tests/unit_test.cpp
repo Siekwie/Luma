@@ -356,6 +356,82 @@ static void test_timings() {
     }
 }
 
+static void test_public_usage_requirements() {
+    TempProject project;
+    project.write("base/base.c");
+    project.write("mid/mid.cpp");
+    project.write("app/main.cpp");
+
+    config::ProjectConfig cfg;
+    cfg.root = project.path();
+    cfg.profile = "debug";
+    cfg.toolchains["gnu"] = config::ToolchainDef{
+        .name = "gnu", .style = config::ToolchainStyle::Gnu, .cc = "my-cc", .cxx = "my-c++",
+        .linker = "", .archiver = "ar", .languages = {}};
+    cfg.active_toolchain = "gnu";
+    cfg.profiles["debug"] = config::ProfileDef{
+        .name = "debug", .defines = {"DEBUG"}, .cflags = {}, .cxxflags = {}, .linkflags = {}, .lto = false};
+
+    config::TargetDef base;
+    base.name = "base";
+    base.kind = config::TargetKind::StaticLibrary;
+    base.sources = {"base/base.c"};
+    base.defines = {"BASE_PRIVATE"};
+    base.public_defines = {"BASE_ABI=1", "SHARED_DEF"};
+    base.public_include_dirs = {"base/include"};
+    base.public_cflags = {"-fsigned-char"};
+    base.public_cxxflags = {"-fno-rtti"};
+    cfg.targets["base"] = base;
+
+    config::TargetDef mid;
+    mid.name = "mid";
+    mid.kind = config::TargetKind::StaticLibrary;
+    mid.sources = {"mid/mid.cpp"};
+    mid.public_defines = {"MID_ABI", "SHARED_DEF"};
+    mid.dependencies = {"base"};
+    cfg.targets["mid"] = mid;
+
+    config::TargetDef app;
+    app.name = "app";
+    app.sources = {"app/main.cpp"};
+    app.defines = {"APP_ONLY", "DEBUG"};
+    app.dependencies = {"mid"};
+    cfg.targets["app"] = app;
+
+    config::BuildPlan plan;
+    const auto err = config::build_plan(cfg, plan);
+    CHECK(!err.has_value());
+    if (err || plan.targets.size() != 3) {
+        return;
+    }
+    // plan.targets is sorted: app, base, mid.
+    const auto& app_info = plan.targets[0];
+    const auto& base_info = plan.targets[1];
+    const auto& mid_info = plan.targets[2];
+
+    using Strings = std::vector<std::string>;
+    // Own defines, own public defines, then dependencies' public defines in
+    // dependency order; duplicates removed; private defines not exported.
+    CHECK(app_info.defines == (Strings{"DEBUG", "APP_ONLY", "MID_ABI", "SHARED_DEF", "BASE_ABI=1"}));
+    CHECK(mid_info.defines == (Strings{"DEBUG", "MID_ABI", "SHARED_DEF", "BASE_ABI=1"}));
+    CHECK(base_info.defines == (Strings{"DEBUG", "BASE_PRIVATE", "BASE_ABI=1", "SHARED_DEF"}));
+    CHECK(std::find(app_info.include_dirs.begin(), app_info.include_dirs.end(), "base/include") !=
+          app_info.include_dirs.end());
+
+    const graph::Task* app_compile = plan.graph.find_task(graph::TaskId{"compile:app:app/main.cpp"});
+    const graph::Task* base_compile = plan.graph.find_task(graph::TaskId{"compile:base:base/base.c"});
+    CHECK(app_compile && base_compile);
+    if (app_compile && base_compile) {
+        const auto& cmd = app_compile->command;
+        CHECK(std::find(cmd.begin(), cmd.end(), "-DBASE_ABI=1") != cmd.end());
+        CHECK(std::find(cmd.begin(), cmd.end(), "-DBASE_PRIVATE") == cmd.end());
+        CHECK(std::find(cmd.begin(), cmd.end(), "-fno-rtti") != cmd.end());
+        CHECK(std::find(cmd.begin(), cmd.end(), "-fsigned-char") == cmd.end());
+        const auto& base_cmd = base_compile->command;
+        CHECK(std::find(base_cmd.begin(), base_cmd.end(), "-fsigned-char") != base_cmd.end());
+    }
+}
+
 int main() {
     test_sha256();
     test_json();
@@ -365,6 +441,7 @@ int main() {
     test_glob();
     test_build_plan_languages_and_outputs();
     test_cache_journal();
+    test_public_usage_requirements();
     test_timings();
 
     if (failures != 0) {

@@ -5,6 +5,8 @@ target("cmath", {
     kind = "static_library",
     sources = { "src/twice.c" },
     include_dirs = { "include" },
+    -- Must be seen by every user of twice.h (checked by #error in both files).
+    public_defines = { "TWICE_ABI=2" },
 })
 
 target("app", {

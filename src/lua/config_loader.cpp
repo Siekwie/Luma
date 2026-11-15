@@ -315,6 +315,30 @@ int api_target(lua_State* L) {
     }
     lua_pop(L, 1);
 
+    lua_getfield(L, 2, "public_defines");
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
+        target.public_defines = read_string_array(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "public_include_dirs");
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
+        target.public_include_dirs = read_path_array(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "public_cflags");
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
+        target.public_cflags = read_string_array(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "public_cxxflags");
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
+        target.public_cxxflags = read_string_array(L, -1);
+    }
+    lua_pop(L, 1);
+
     lua_getfield(L, 2, "system_libs");
     if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.system_libs = read_string_array(L, -1);

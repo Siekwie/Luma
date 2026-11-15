@@ -266,8 +266,8 @@ With `--format json`, prints a single JSON object (one line) to stdout:
 | `language` | Declared target language, `cxx` (default) or `c`. Individual sources are compiled by extension. |
 | `output` | Artifact path (`.exe` / `.dll` / `.lib` on Windows; no suffix / `.so` (`.dylib` on macOS) / `.a` elsewhere; GNU-style libraries get a `lib` prefix). |
 | `sources` | All files matched by `sources`, including non-compiled ones such as headers. |
-| `include_dirs` | Effective include directories: the target's own, then those of its (transitive) dependencies. |
-| `defines` | Effective defines: profile, then target. |
+| `include_dirs` | Effective include directories: the target's own (`include_dirs`, `public_include_dirs`), then those of its (transitive) dependencies. |
+| `defines` | Effective defines, exactly as passed to the compiler: profile, target `defines`, target `public_defines`, then the `public_defines` of its transitive dependencies in dependency order; duplicates removed. |
 | `dependencies` | Direct dependencies as declared. |
 
 All paths are absolute and use forward slashes. Strings use standard JSON
@@ -308,8 +308,46 @@ written) if `luma.lua` or `src/main.cpp` already exists.
 
 Target fields: `kind` (`executable`, `static_library`, `shared_library`),
 `language` (`cxx` or `c`), `sources`, `include_dirs`, `defines`, `cflags`,
-`cxxflags`, `linkflags`, `dependencies`, `system_libs`. Lists may also be a
-single string.
+`cxxflags`, `linkflags`, `dependencies`, `system_libs`, and the usage
+requirements `public_defines`, `public_include_dirs`, `public_cflags`,
+`public_cxxflags`. Lists may also be a single string.
+
+### Usage requirements (exported settings)
+
+Some settings must be shared by a library and everything that uses its
+headers, or the ABI silently mismatches. Declare them as `public_*`:
+
+```lua
+target "imgui" {
+    kind = "static_library",
+    sources = glob "third_party/imgui/*.cpp",
+    include_dirs = { "third_party/imgui" },
+    public_defines = { "IMGUI_USE_WCHAR32", "IMGUI_DISABLE_OBSOLETE_FUNCTIONS" },
+}
+
+target "app" {
+    kind = "executable",
+    sources = glob "src/**/*.cpp",
+    dependencies = { "imgui" },   -- compiled with -DIMGUI_USE_WCHAR32 too
+}
+```
+
+| Field | Applies to the target | Exported to dependents |
+| --- | --- | --- |
+| `defines`, `cflags`, `cxxflags` | yes | no |
+| `public_defines`, `public_cflags`, `public_cxxflags` | yes | yes, transitively |
+| `include_dirs`, `public_include_dirs` | yes | yes, transitively |
+
+Exported settings flow through every dependency edge, including through
+static and shared libraries (`app → ui → imgui` gives `app` imgui's
+public defines). Order: the profile's, the target's own, its own public
+ones, then those of its dependencies in dependency order (dependents before
+the libraries they use). Defines and include directories are
+deduplicated, keeping the first occurrence; flags keep their order and are
+not deduplicated (so pairs like `-include x.h` survive), with
+dependencies' public flags last. `public_cflags` apply to C sources and
+`public_cxxflags` to C++ sources. `luma targets --format json`, `luma
+compdb` and the build all use these effective values.
 
 Without a `toolchain()` declaration Luma picks the first available of
 `clang++`/`clang`, `g++`/`gcc` and MSVC `cl`. Sources ending in `.c` are

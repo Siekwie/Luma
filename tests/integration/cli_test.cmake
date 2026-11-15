@@ -205,6 +205,23 @@ if(NOT cxx_compiler STREQUAL "cl")
     endif()
 endif()
 
+# --- public_defines propagate to dependents ------------------------------------
+run_luma("${mixed}" json code targets --format json)
+string(JSON t0 GET "${json}" targets 0 name)
+if(t0 STREQUAL "app")
+    set(app_index 0)
+else()
+    set(app_index 1)
+endif()
+string(JSON app_defines GET "${json}" targets ${app_index} defines)
+if(NOT (app_defines MATCHES "TWICE_ABI=2" AND app_defines MATCHES "APP_GREETING"))
+    fail("app's effective defines include cmath's public define (${app_defines})")
+endif()
+file(READ "${mixed}/compile_commands.json" compdb)
+if(NOT (compdb MATCHES "-DTWICE_ABI=2[^}]*main\\.cpp"))
+    fail("compdb carries the public define for dependents")
+endif()
+
 # --- failing build -------------------------------------------------------------
 file(WRITE "${mixed}/src/broken.cpp" "int broken() { return undeclared_symbol; }\n")
 run_luma("${mixed}" out code build)

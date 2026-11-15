@@ -56,6 +56,12 @@ struct TargetDef {
     std::vector<std::string> linkflags;
     std::vector<std::string> dependencies;
     std::vector<std::string> system_libs;
+    /// Usage requirements: apply to this target and, transitively, to every
+    /// target that depends on it. (Plain include_dirs are exported too.)
+    std::vector<std::string> public_defines;
+    std::vector<Path> public_include_dirs;
+    std::vector<std::string> public_cflags;
+    std::vector<std::string> public_cxxflags;
 };
 
 struct ProjectConfig {
