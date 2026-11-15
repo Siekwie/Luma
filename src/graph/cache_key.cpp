@@ -1,9 +1,13 @@
 #include "luma/graph/task.hpp"
 
-#include <cstdint>
+#include "luma/filesystem/sha256.hpp"
+
+#include <algorithm>
 #include <sstream>
 
 namespace luma::graph {
+
+namespace fs = luma::fs;
 
 namespace {
 
@@ -26,7 +30,10 @@ Hash compute_cache_key(
         append_kv(out, "cmd", arg);
     }
 
-    for (const auto& [key, value] : task.environment.vars) {
+    std::vector<std::pair<std::string, std::string>> env(
+        task.environment.vars.begin(), task.environment.vars.end());
+    std::sort(env.begin(), env.end());
+    for (const auto& [key, value] : env) {
         append_kv(out, "env." + key, value);
     }
 
@@ -46,17 +53,7 @@ Hash compute_cache_key(
         append_kv(out, "config", configuration_fingerprint);
     }
 
-    // FNV-1a 64-bit over the canonical string. Replace with a proper hash later.
-    const std::string canonical = out.str();
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (unsigned char c : canonical) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-
-    std::ostringstream hex;
-    hex << std::hex << hash;
-    return hex.str();
+    return fs::sha256_hex(out.str());
 }
 
 } // namespace luma::graph

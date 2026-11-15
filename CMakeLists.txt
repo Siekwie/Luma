@@ -14,6 +14,7 @@ set(LUMA_CORE_SOURCES
     src/filesystem/path_util.cpp
     src/filesystem/glob.cpp
     src/filesystem/hash.cpp
+    src/filesystem/sha256.cpp
     src/config/graph_builder.cpp
     src/config/model.cpp
     src/lua/config_loader.cpp
@@ -27,10 +28,6 @@ set(LUMA_CORE_SOURCES
 add_library(luma_core ${LUMA_CORE_SOURCES})
 target_include_directories(luma_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(luma_core PUBLIC lua54)
-
-if(WIN32)
-    target_link_libraries(luma_core PUBLIC bcrypt)
-endif()
 
 add_executable(luma
     src/cli/main.cpp
