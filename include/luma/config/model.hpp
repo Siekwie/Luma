@@ -29,6 +29,7 @@ struct ProfileDef {
     std::vector<std::string> cxxflags;
     std::vector<std::string> linkflags;
     bool lto = false;
+    bool lto_set = false;  // lto given explicitly (inheritance keeps the parent's otherwise)
     // For the built-in profile names ("debug", "release"): start from Luma's toolchain
     // defaults (-O0 -g / -O3, warnings, C++20) and append this profile's settings.
     // Set `inherit = false` in luma.lua to start from nothing.

@@ -23,6 +23,7 @@
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -234,10 +235,25 @@ extern "C" void on_cancel_signal(int signal_number) {
 constexpr std::array<int, 3> kCancelSignals = {SIGINT, SIGTERM, SIGHUP};
 std::array<struct sigaction, 3> g_previous_handlers{};
 
-std::string drain_fd(int fd) {
+/// Reads until EOF, or until `abandon` is set (a timed-out child's grandchild
+/// may keep the pipe open forever).
+std::string drain_fd(int fd, const std::atomic<bool>* abandon = nullptr) {
     std::string text;
     std::array<char, 4096> buffer{};
     while (true) {
+        if (abandon) {
+            pollfd pfd{fd, POLLIN, 0};
+            const int ready = ::poll(&pfd, 1, 100);
+            if (ready == 0) {
+                if (abandon->load()) {
+                    break;
+                }
+                continue;
+            }
+            if (ready < 0 && errno == EINTR) {
+                continue;
+            }
+        }
         const ssize_t got = ::read(fd, buffer.data(), buffer.size());
         if (got > 0) {
             text.append(buffer.data(), static_cast<std::size_t>(got));
@@ -329,17 +345,23 @@ namespace {
 /// Kills a child that outlives its timeout. `kill` runs on the watchdog thread.
 class Watchdog {
 public:
-    template <typename Kill>
-    Watchdog(double seconds, bool& timed_out, Kill kill) {
+    /// After the timeout `kill` runs; if the output is still not drained a
+    /// second later (a grandchild outside the kill's reach holds the pipe),
+    /// `abandon` runs so the reads give up.
+    template <typename Kill, typename Abandon>
+    Watchdog(double seconds, bool& timed_out, Kill kill, Abandon abandon) {
         if (seconds <= 0) {
             return;
         }
-        thread_ = std::thread([this, seconds, &timed_out, kill]() {
+        thread_ = std::thread([this, seconds, &timed_out, kill, abandon]() {
             std::unique_lock lock(mutex_);
             const auto limit = std::chrono::duration<double>(seconds);
             if (!cv_.wait_for(lock, limit, [this]() { return done_; })) {
                 timed_out = true;
                 kill();
+                if (!cv_.wait_for(lock, std::chrono::seconds(1), [this]() { return done_; })) {
+                    abandon();
+                }
             }
         });
     }
@@ -464,8 +486,31 @@ ProcessResult run_process(
 
     // Drain the pipes before waiting: a child that fills a pipe buffer would
     // otherwise block forever.
+    result.started = true;
+    // With a timeout the child gets its own (nested) job, so the kill reaches
+    // everything it started, not just the direct child.
+    HANDLE run_job = nullptr;
+    if (timeout_seconds > 0) {
+        run_job = CreateJobObjectW(nullptr, nullptr);
+        if (run_job && !AssignProcessToJobObject(run_job, pi.hProcess)) {
+            CloseHandle(run_job);
+            run_job = nullptr;
+        }
+    }
     const HANDLE child_process = pi.hProcess;
-    Watchdog watchdog(timeout_seconds, result.timed_out, [child_process]() { TerminateProcess(child_process, 1); });
+    Watchdog watchdog(
+        timeout_seconds, result.timed_out,
+        [child_process, run_job]() {
+            if (!run_job || !TerminateJobObject(run_job, 1)) {
+                TerminateProcess(child_process, 1);
+            }
+        },
+        [stdout_read, stderr_read]() {
+            CancelIoEx(stdout_read, nullptr);
+            if (stderr_read) {
+                CancelIoEx(stderr_read, nullptr);
+            }
+        });
     std::thread stderr_thread;
     if (stderr_read) {
         stderr_thread = std::thread([&]() { result.stderr_text = drain_handle(stderr_read); });
@@ -484,6 +529,9 @@ ProcessResult run_process(
     CloseHandle(stdout_read);
     if (stderr_read) {
         CloseHandle(stderr_read);
+    }
+    if (run_job) {
+        CloseHandle(run_job);
     }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
@@ -552,12 +600,16 @@ ProcessResult run_process(
         return result;
     }
 
-    Watchdog watchdog(timeout_seconds, result.timed_out, [pid]() { kill(-pid, SIGKILL); });
+    result.started = true;
+    std::atomic<bool> abandon{false};
+    Watchdog watchdog(
+        timeout_seconds, result.timed_out, [pid]() { kill(-pid, SIGKILL); }, [&abandon]() { abandon.store(true); });
+    const std::atomic<bool>* abandon_flag = timeout_seconds > 0 ? &abandon : nullptr;
     std::thread stderr_thread;
     if (!merge_output) {
-        stderr_thread = std::thread([&]() { result.stderr_text = drain_fd(stderr_pipe[0]); });
+        stderr_thread = std::thread([&]() { result.stderr_text = drain_fd(stderr_pipe[0], abandon_flag); });
     }
-    result.stdout_text = drain_fd(stdout_pipe[0]);
+    result.stdout_text = drain_fd(stdout_pipe[0], abandon_flag);
     if (stderr_thread.joinable()) {
         stderr_thread.join();
     }

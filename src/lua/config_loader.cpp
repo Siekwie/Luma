@@ -238,7 +238,10 @@ int api_profile(lua_State* L) {
     }
     lua_pop(L, 1);
 
-    profile.lto = read_bool_field(L, 2, "lto", false);
+    lua_getfield(L, 2, "lto");
+    profile.lto_set = lua_isboolean(L, -1);
+    profile.lto = profile.lto_set && lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
     lua_getfield(L, 2, "inherit");
     if (lua_type(L, -1) == LUA_TSTRING) {
         profile.inherit_from = lua_tostring(L, -1);
@@ -613,7 +616,10 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
             append(base.cflags, user.cflags);
             append(base.cxxflags, user.cxxflags);
             append(base.linkflags, user.linkflags);
-            base.lto = user.lto;
+            if (user.lto_set) {
+                base.lto = user.lto;
+                base.lto_set = true;
+            }
             base.inherit = true;
             return base;
         };

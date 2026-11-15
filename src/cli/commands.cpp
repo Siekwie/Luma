@@ -433,7 +433,7 @@ int cmd_test(const ParsedArgs& args) {
             r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             r.exit_code = pr.exit_code;
             r.output = pr.stdout_text + pr.stderr_text;
-            r.status = pr.timed_out ? "timeout" : pr.exit_code == 0 ? "passed" : pr.exit_code < 0 ? "error" : "failed";
+            r.status = pr.timed_out ? "timeout" : !pr.started ? "error" : pr.exit_code == 0 ? "passed" : "failed";
             report(r);
         }
     };

@@ -529,6 +529,14 @@ std::optional<BuildPlanError> build_plan(
             append(cflags, profile->cflags);
             append(cxxflags, profile->cxxflags);
             append(linkflags, profile->linkflags);
+            if (profile->lto) {
+                // Link-time optimisation: compile and link with the toolchain's switch.
+                const bool msvc = toolchain.style == ToolchainStyle::Msvc;
+                const std::string compile_flag = msvc ? "/GL" : "-flto";
+                cflags.push_back(compile_flag);
+                cxxflags.push_back(compile_flag);
+                linkflags.push_back(msvc ? "/LTCG" : "-flto");
+            }
         }
         append(cflags, target.cflags);
         append(cxxflags, target.cxxflags);

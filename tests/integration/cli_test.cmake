@@ -408,6 +408,17 @@ endif()
 file(WRITE "${prof}/luma.lua" [=[
 project "prof"
 target "app" { kind = "executable", sources = { "src/main.cpp" } }
+profile "release" { lto = true }
+profile "rel2" { inherit = "release", defines = { "R2" } }
+]=])
+run_luma("${prof}" out code compdb --profile rel2)
+file(READ "${prof}/compile_commands.json" compdb)
+if(NOT (code EQUAL 0 AND (compdb MATCHES "-flto" OR compdb MATCHES "/GL")))
+    fail("inherit keeps the parent's lto = true")
+endif()
+file(WRITE "${prof}/luma.lua" [=[
+project "prof"
+target "app" { kind = "executable", sources = { "src/main.cpp" } }
 profile "asan" { inherit = "debug", cxxflags = { "-fsanitize=address" } }
 ]=])
 run_luma("${prof}" out code compdb --profile asan)

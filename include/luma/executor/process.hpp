@@ -13,6 +13,9 @@ struct ProcessResult {
     std::string stderr_text;
     /// The child ran longer than the timeout and was killed.
     bool timed_out = false;
+    /// The child was started (exit_code is then its real exit status, which on
+    /// Windows can be negative for crashes such as 0xC0000005).
+    bool started = false;
 };
 
 /// Run a command (argv-style, PATH lookup) and capture its output.
