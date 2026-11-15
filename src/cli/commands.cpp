@@ -390,12 +390,13 @@ int cmd_init(const ParsedArgs& args) {
         "    include_dirs = { \"include\" },\n"
         "})\n"
         "\n"
-        "-- Without profile() declarations Luma provides \"debug\" and \"release\"\n"
-        "-- profiles with sensible flags for the detected toolchain. Declaring any\n"
-        "-- profile replaces those defaults, for example:\n"
+        "-- Luma provides \"debug\" (-O0 -g) and \"release\" (-O3) profiles with sensible\n"
+        "-- flags for the detected toolchain. Declaring one of them adds to those defaults\n"
+        "-- (your flags come last, so they win); add inherit = false to start from scratch:\n"
         "--\n"
-        "-- profile(\"debug\", { defines = { \"DEBUG\" }, cxxflags = { \"-O0\", \"-g\", \"-std=c++20\" } })\n"
-        "-- profile(\"release\", { cxxflags = { \"-O2\", \"-std=c++20\" } })\n";
+        "-- profile(\"debug\", { defines = { \"MYAPP_DEBUG\" } })\n"
+        "-- profile(\"release\", { cxxflags = { \"-march=native\" } })\n"
+        "-- profile(\"asan\", { cxxflags = { \"-O1\", \"-g\", \"-fsanitize=address\" }, linkflags = { \"-fsanitize=address\" } })\n";
 
     const std::string main_cpp =
         "#include <iostream>\n"
