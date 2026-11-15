@@ -70,8 +70,8 @@ Both `target "x" { ... }` and `target("x", { ... })` work.
 
 | Command | Description |
 | --- | --- |
-| `luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb]` | Build all targets, or the named targets and their dependencies. |
-| `luma run <target> [--profile P] [-j N] [--no-compdb] [-- args...]` | Build the target, then run its executable. |
+| `luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb] [--timings]` | Build all targets, or the named targets and their dependencies. |
+| `luma run <target> [--profile P] [-j N] [--no-compdb] [--timings] [-- args...]` | Build the target, then run its executable. |
 | `luma targets [--format table\|json] [--profile P]` | Describe the project and its targets. |
 | `luma compdb [--profile P] [--output PATH]` | Write a clang `compile_commands.json`. |
 | `luma init [name]` | Create a new project in the current directory. |
@@ -163,6 +163,54 @@ through `-MMD` depfiles or MSVC `/showIncludes`), or a task it depends on
 runs. Fingerprints are stored in `.luma/cache/manifest.txt`. For localized
 MSVC toolsets set `LUMA_MSVC_DEPS_PREFIX` to the translated
 `Note: including file:` prefix.
+
+#### Timings
+
+With `--timings` (on `build` and `run`), one more line follows the final
+status line (also after `luma: build failed`):
+
+```text
+luma: build succeeded (2 run, 2 up to date) in 0.52s
+luma: timings {"total_ms":521,"tasks":[{"id":"compile:hello:src/main.cpp","verb":"compile","desc":"src/main.cpp","ms":448,"output":"/abs/root/build/obj/hello/src/main.cpp.o","ok":true},{"id":"link:hello","verb":"link","desc":"build/hello","ms":61,"output":"/abs/root/build/hello","ok":true}]}
+```
+
+The JSON is always on that single line. `total_ms` is the wall time of the
+whole command up to the status line; `tasks` lists only tasks that actually
+ran in this build, longest first. `id` is the task id, `verb`/`desc` are
+the words of its progress line, `ms` the wall time of its command,
+`output` the absolute path of its (first) output, and `ok` whether it
+succeeded. A no-op build prints `"tasks":[]`. Without `--timings` the
+output is unchanged. For `luma run` the line is printed before the program
+starts.
+
+Every build (not dry runs) also appends a record to `.luma/timings.jsonl`,
+whether or not `--timings` was given. Each line is one JSON object:
+
+```json
+{"timestamp":1794717093,"profile":"debug","status":"succeeded","total_ms":521,"tasks":[...]}
+```
+
+`timestamp` is Unix time in seconds, `status` is `succeeded`, `failed` or
+`cancelled`, and `tasks` has the same entries as above. The file keeps the
+last 50 builds and is replaced atomically.
+
+#### Cancellation and crash safety
+
+Ctrl+C, `SIGTERM` or `SIGHUP` (Windows: Ctrl+C, Ctrl+Break, closing the
+console) during a build stops it in an orderly way: running tasks are
+terminated (their whole process group on POSIX), no new tasks start, the
+cache is saved, and luma prints `luma: build failed` (plus
+`luma: build cancelled` on stderr) and exits with `128 + signal` (130 for
+Ctrl+C). A second signal terminates immediately.
+
+The cache stays consistent even if luma is killed outright (`SIGKILL`,
+`TerminateProcess`): the manifest is only replaced atomically, and while a
+build runs every task start and completion is appended to
+`.luma/cache/journal.txt`. The next build replays the journal, so tasks
+that were interrupted, whose outputs may be half-written, run again, and
+tasks that finished are not repeated. On Windows all child processes live
+in a job object that is killed together with luma; on Linux children
+receive `SIGTERM` when luma dies.
 
 ### `luma run`
 
