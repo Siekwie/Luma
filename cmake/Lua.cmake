@@ -43,7 +43,7 @@ add_library(lua54 STATIC ${LUA54_CORE_SOURCES})
 target_include_directories(lua54 PUBLIC ${LUA54_SRC_DIR})
 
 if(WIN32)
-    target_compile_definitions(lua54 PUBLIC LUA_USE_WINDOWS)
+    # luaconf.h defines LUA_USE_WINDOWS itself on _WIN32.
     if(MSVC)
         target_compile_definitions(lua54 PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
