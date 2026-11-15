@@ -1,0 +1,11 @@
+# rungit jobs (see https://rungit.wiest-lab.eu/help)
+jobs:
+  linux:
+    image: gcc:14
+    command: |
+      sh .ci/linux.sh
+  windows:
+    runs_on: windows
+    command: powershell -NoProfile -ExecutionPolicy Bypass -File .ci/windows.ps1
+    artifacts:
+      - dist/**
