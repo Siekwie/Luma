@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(luma VERSION 0.1.0 LANGUAGES CXX C)
+project(luma VERSION 0.2.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,8 @@ set(LUMA_CORE_SOURCES
     src/executor/executor.cpp
     src/executor/depfile.cpp
     src/cli/session.cpp
+    src/cli/introspect.cpp
+    src/util/json.cpp
 )
 
 add_library(luma_core ${LUMA_CORE_SOURCES})
@@ -35,6 +37,7 @@ add_executable(luma
     src/cli/commands.cpp
 )
 target_link_libraries(luma PRIVATE luma_core)
+target_compile_definitions(luma PRIVATE LUMA_VERSION="${PROJECT_VERSION}")
 
 find_package(Threads REQUIRED)
 target_link_libraries(luma_core PUBLIC Threads::Threads)

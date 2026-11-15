@@ -1,13 +1,23 @@
 #include "luma/cli/commands.hpp"
 
 #include "luma/cache/cache_store.hpp"
+#include "luma/cli/introspect.hpp"
 #include "luma/cli/session.hpp"
 #include "luma/executor/executor.hpp"
+#include "luma/executor/process.hpp"
 #include "luma/filesystem/path_util.hpp"
 
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
+
+#ifndef LUMA_VERSION
+#define LUMA_VERSION "0.0.0"
+#endif
 
 namespace luma::cli {
 
@@ -15,204 +25,497 @@ namespace fs = luma::fs;
 
 namespace {
 
-void print_usage() {
-    std::cerr
-        << "Luma — a modern build graph engine\n\n"
+void print_usage(std::ostream& out) {
+    out << "Luma - a build graph engine with Lua configuration\n\n"
         << "Usage:\n"
-        << "  luma build [target...] [--profile name] [--dry-run] [--verbose] [-j N]\n"
+        << "  luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb]\n"
+        << "  luma run <target> [--profile P] [-j N] [--no-compdb] [-- args...]\n"
+        << "  luma targets [--format table|json] [--profile P]\n"
+        << "  luma compdb [--profile P] [--output PATH]\n"
+        << "  luma init [name]\n"
         << "  luma clean\n"
-        << "  luma graph [--format dot]\n"
-        << "  luma explain <target>\n"
-        << "  luma inspect <target>\n"
+        << "  luma graph [--format dot] [--profile P]\n"
+        << "  luma explain <target> [--profile P]\n"
+        << "  luma inspect <target> [--profile P]\n"
         << "  luma --version\n"
         << "  luma --help\n";
 }
 
 struct ParsedArgs {
     std::string command;
-    std::string profile = "debug";
-    std::string graph_format = "dot";
-    std::string explain_target;
-    std::string inspect_target;
-    std::vector<std::string> build_targets;
+    std::string profile;
+    std::string format;
+    std::string output;
+    std::vector<std::string> positionals;
+    std::vector<std::string> passthrough;
     bool dry_run = false;
     bool verbose = false;
+    bool no_compdb = false;
     std::size_t jobs = 0;
+    std::string error;
 };
+
+bool parse_jobs(std::string_view text, std::size_t& jobs) {
+    if (text.empty()) {
+        return false;
+    }
+    std::size_t value = 0;
+    for (const char c : text) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+        value = value * 10 + static_cast<std::size_t>(c - '0');
+        if (value > 4096) {
+            return false;
+        }
+    }
+    jobs = value;
+    return true;
+}
 
 ParsedArgs parse_args(int argc, char** argv) {
     ParsedArgs args;
     if (argc < 2) {
         return args;
     }
-
     args.command = argv[1];
+
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
-        if (arg == "--profile" && i + 1 < argc) {
-            args.profile = argv[++i];
-        } else if (arg == "--format" && i + 1 < argc) {
-            args.graph_format = argv[++i];
-        } else if (arg == "--dry-run") {
+
+        // Options taking a value accept both "--opt value" and "--opt=value".
+        auto take_value = [&](std::string_view name, std::string& out) {
+            if (arg == name) {
+                if (i + 1 >= argc) {
+                    args.error = "missing value for " + std::string(name);
+                    return true;
+                }
+                out = argv[++i];
+                return true;
+            }
+            if (arg.size() > name.size() && arg.starts_with(name) && arg[name.size()] == '=') {
+                out = std::string(arg.substr(name.size() + 1));
+                return true;
+            }
+            return false;
+        };
+
+        std::string jobs_text;
+        if (arg == "--") {
+            for (int k = i + 1; k < argc; ++k) {
+                args.passthrough.emplace_back(argv[k]);
+            }
+            break;
+        }
+        if (take_value("--profile", args.profile) || take_value("--format", args.format) ||
+            take_value("--output", args.output) || take_value("-o", args.output)) {
+        } else if (take_value("--jobs", jobs_text) || take_value("-j", jobs_text) ||
+                   (arg.starts_with("-j") && arg.size() > 2 && (jobs_text = arg.substr(2), true))) {
+            if (args.error.empty() && !parse_jobs(jobs_text, args.jobs)) {
+                args.error = "invalid job count: " + jobs_text;
+            }
+        } else if (arg == "--dry-run" || arg == "-n") {
             args.dry_run = true;
         } else if (arg == "--verbose") {
             args.verbose = true;
-        } else if (arg == "-j" && i + 1 < argc) {
-            args.jobs = static_cast<std::size_t>(std::stoul(argv[++i]));
-        } else if (args.command == "explain") {
-            args.explain_target = argv[i];
-        } else if (args.command == "inspect") {
-            args.inspect_target = argv[i];
-        } else if (args.command == "build") {
-            args.build_targets.emplace_back(argv[i]);
+        } else if (arg == "--no-compdb") {
+            args.no_compdb = true;
+        } else if (arg.starts_with("-") && arg.size() > 1) {
+            args.error = "unknown option: " + std::string(arg);
+        } else {
+            args.positionals.emplace_back(arg);
+        }
+        if (!args.error.empty()) {
+            break;
         }
     }
     return args;
 }
 
-SessionOptions session_options_from(const ParsedArgs& args) {
-    SessionOptions options;
-    options.project_root = fs::normalize(".");
-    options.profile = args.profile;
-    options.targets = args.build_targets;
-    return options;
+int fail(const std::string& message) {
+    std::cout.flush();
+    std::cerr << "luma: error: " << message << '\n';
+    return 1;
 }
 
-CommandResult cmd_version() {
-    std::cout << "luma 0.1.0\n";
-    return {0};
+std::optional<SessionError> load_session(
+    Session& session, const ParsedArgs& args, const std::vector<std::string>& targets = {}) {
+    SessionOptions options;
+    options.project_root = ".";
+    options.profile = args.profile;
+    options.targets = targets;
+    return Session::load(session, options);
+}
+
+/// Refresh <root>/compile_commands.json when its fingerprint changed.
+void refresh_compdb(const Session& session, bool verbose) {
+    const config::BuildPlan* plan = &session.plan;
+    config::BuildPlan full_plan;
+    if (session.plan.targets.size() != session.config.targets.size()) {
+        // A partial build still records every target's compile commands.
+        if (config::build_plan(session.config, full_plan)) {
+            return;
+        }
+        plan = &full_plan;
+    }
+    const Path output = fs::join(session.config.root, "compile_commands.json");
+    const auto result = write_compdb(session.config, *plan, output, session.cache_dir, true);
+    if (!result.ok) {
+        std::cerr << "luma: warning: could not update compile_commands.json: " << result.error << '\n';
+    } else if (result.written && verbose) {
+        std::cout << "luma: wrote " << result.path << '\n';
+    }
+}
+
+std::string format_seconds(std::chrono::steady_clock::duration elapsed) {
+    const double seconds = std::chrono::duration<double>(elapsed).count();
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%.2fs", seconds);
+    return buffer;
+}
+
+/// Shared by `build` and `run`. Prints the final status line.
+int build_session(Session& session, const ParsedArgs& args,
+                  std::chrono::steady_clock::time_point start) {
+    if (!args.no_compdb && !args.dry_run) {
+        refresh_compdb(session, args.verbose);
+    }
+
+    cache::CacheStore cache(session.cache_dir);
+    cache.load();
+
+    const executor::ExecutorOptions options{
+        .dry_run = args.dry_run,
+        .verbose = args.verbose,
+        .jobs = args.jobs,
+    };
+    const auto result = executor::execute(session.config, session.plan, cache, options);
+
+    if (result.exit_code != 0) {
+        std::cout << "luma: build failed" << std::endl;
+        return result.exit_code;
+    }
+    if (args.dry_run) {
+        std::cout << "luma: dry run (" << result.tasks_run << " would run, " << result.tasks_skipped
+                  << " up to date)" << std::endl;
+        return 0;
+    }
+    std::cout << "luma: build succeeded (" << result.tasks_run << " run, " << result.tasks_skipped
+              << " up to date) in " << format_seconds(std::chrono::steady_clock::now() - start)
+              << std::endl;
+    return 0;
+}
+
+int cmd_build(const ParsedArgs& args) {
+    const auto start = std::chrono::steady_clock::now();
+    if (!args.passthrough.empty()) {
+        return fail("'luma build' does not take arguments after --");
+    }
+    Session session;
+    if (const auto err = load_session(session, args, args.positionals)) {
+        fail(err->message);
+        std::cout << "luma: build failed" << std::endl;
+        return 1;
+    }
+    return build_session(session, args, start);
+}
+
+int cmd_run(const ParsedArgs& args) {
+    const auto start = std::chrono::steady_clock::now();
+    if (args.positionals.empty()) {
+        return fail("usage: luma run <target> [--profile P] [-- args...]");
+    }
+    if (args.positionals.size() > 1) {
+        return fail("unexpected argument '" + args.positionals[1] +
+                    "' (pass program arguments after --)");
+    }
+    if (args.dry_run) {
+        return fail("'luma run' does not support --dry-run");
+    }
+    const std::string& target_name = args.positionals.front();
+
+    Session session;
+    if (const auto err = load_session(session, args, {target_name})) {
+        fail(err->message);
+        std::cout << "luma: build failed" << std::endl;
+        return 1;
+    }
+
+    const config::TargetInfo* target = nullptr;
+    for (const auto& info : session.plan.targets) {
+        if (info.name == target_name) {
+            target = &info;
+        }
+    }
+    if (!target || target->kind != config::TargetKind::Executable) {
+        return fail("target '" + target_name + "' is not an executable");
+    }
+
+    if (const int code = build_session(session, args, start); code != 0) {
+        return code;
+    }
+
+    std::vector<std::string> command = {fs::to_native(fs::join(session.config.root, target->output))};
+    command.insert(command.end(), args.passthrough.begin(), args.passthrough.end());
+    std::cout.flush();
+    std::cerr.flush();
+    return executor::run_process_interactive(command);
+}
+
+int cmd_targets(const ParsedArgs& args) {
+    const std::string format = args.format.empty() ? "table" : args.format;
+    if (format != "json" && format != "table") {
+        return fail("unsupported format for targets: " + format + " (expected json or table)");
+    }
+    if (!args.positionals.empty()) {
+        return fail("unexpected argument: " + args.positionals.front());
+    }
+    Session session;
+    if (const auto err = load_session(session, args)) {
+        return fail(err->message);
+    }
+    std::cout << (format == "json" ? targets_json(session) : targets_table(session)) << std::flush;
+    return 0;
+}
+
+int cmd_compdb(const ParsedArgs& args) {
+    if (!args.positionals.empty()) {
+        return fail("unexpected argument: " + args.positionals.front());
+    }
+    Session session;
+    if (const auto err = load_session(session, args)) {
+        return fail(err->message);
+    }
+    const Path output = args.output.empty() ? fs::join(session.config.root, "compile_commands.json")
+                                            : fs::absolute(args.output);
+    const auto result = write_compdb(session.config, session.plan, output, session.cache_dir, false);
+    if (!result.ok) {
+        return fail(result.error);
+    }
+    std::cout << result.path << std::endl;
+    return 0;
+}
+
+bool valid_project_name(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    for (const char c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool write_new_file(const Path& path, const std::string& content) {
+    std::ofstream out(fs::to_native(path), std::ios::binary);
+    out << content;
+    return static_cast<bool>(out.flush());
+}
+
+int cmd_init(const ParsedArgs& args) {
+    if (args.positionals.size() > 1) {
+        return fail("usage: luma init [name]");
+    }
+    const Path dir = fs::absolute(".");
+
+    std::string name;
+    if (!args.positionals.empty()) {
+        name = args.positionals.front();
+        if (!valid_project_name(name)) {
+            return fail("invalid project name '" + name + "' (use letters, digits, '_', '-', '.')");
+        }
+    } else {
+        name = fs::filename(dir);
+        for (char& c : name) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.') {
+                c = '_';
+            }
+        }
+        if (!valid_project_name(name)) {
+            name = "app";
+        }
+    }
+
+    const Path config_path = fs::join(dir, "luma.lua");
+    const Path main_path = fs::join(dir, "src/main.cpp");
+    for (const Path& path : {config_path, main_path}) {
+        if (fs::exists(path)) {
+            return fail("refusing to overwrite existing " + fs::relative_to(path, dir));
+        }
+    }
+
+    const std::string config =
+        "project(\"" + name + "\")\n"
+        "\n"
+        "builddir(\"build\")\n"
+        "\n"
+        "target(\"" + name + "\", {\n"
+        "    kind = \"executable\",\n"
+        "    sources = glob(\"src/**/*.cpp\"),\n"
+        "    include_dirs = { \"include\" },\n"
+        "})\n"
+        "\n"
+        "-- Without profile() declarations Luma provides \"debug\" and \"release\"\n"
+        "-- profiles with sensible flags for the detected toolchain. Declaring any\n"
+        "-- profile replaces those defaults, for example:\n"
+        "--\n"
+        "-- profile(\"debug\", { defines = { \"DEBUG\" }, cxxflags = { \"-O0\", \"-g\", \"-std=c++20\" } })\n"
+        "-- profile(\"release\", { cxxflags = { \"-O2\", \"-std=c++20\" } })\n";
+
+    const std::string main_cpp =
+        "#include <iostream>\n"
+        "\n"
+        "int main() {\n"
+        "    std::cout << \"Hello from " + name + "!\\n\";\n"
+        "    return 0;\n"
+        "}\n";
+
+    fs::create_directories(fs::join(dir, "src"));
+    fs::create_directories(fs::join(dir, "include"));
+    if (!write_new_file(config_path, config) || !write_new_file(main_path, main_cpp)) {
+        return fail("failed to write project files in " + dir);
+    }
+    std::cout << "created luma.lua\ncreated src/main.cpp\ncreated include/\n";
+
+    const Path gitignore = fs::join(dir, ".gitignore");
+    if (!fs::exists(gitignore) &&
+        write_new_file(gitignore, "build/\n.luma/\ncompile_commands.json\n")) {
+        std::cout << "created .gitignore\n";
+    }
+    std::cout << "\nNext: luma build && luma run " << name << std::endl;
+    return 0;
+}
+
+int cmd_graph(const ParsedArgs& args) {
+    const std::string format = args.format.empty() ? "dot" : args.format;
+    if (format != "dot") {
+        return fail("unsupported graph format: " + format);
+    }
+    Session session;
+    if (const auto err = load_session(session, args)) {
+        return fail(err->message);
+    }
+    emit_dot(session.plan.graph);
+    return 0;
+}
+
+int cmd_inspect(const ParsedArgs& args) {
+    if (args.positionals.size() != 1) {
+        return fail("usage: luma inspect <target>");
+    }
+    Session session;
+    if (const auto err = load_session(session, args)) {
+        return fail(err->message);
+    }
+    if (!config::find_target(session.config, args.positionals.front())) {
+        return fail("unknown target: " + args.positionals.front());
+    }
+    inspect_target(session.config, args.positionals.front());
+    return 0;
+}
+
+int cmd_explain(const ParsedArgs& args) {
+    if (args.positionals.size() != 1) {
+        return fail("usage: luma explain <target>");
+    }
+    const std::string& target = args.positionals.front();
+    Session session;
+    if (const auto err = load_session(session, args, {target})) {
+        return fail(err->message);
+    }
+    cache::CacheStore cache(session.cache_dir);
+    cache.load();
+
+    const auto explanations =
+        executor::explain_target(session.plan, cache, target, session.config.root);
+
+    bool would_rebuild = false;
+    for (const auto& item : explanations) {
+        would_rebuild = would_rebuild || item.would_run;
+    }
+    if (!would_rebuild) {
+        std::cout << target << " is up to date\n";
+        return 0;
+    }
+
+    std::cout << target << " would rebuild because:\n";
+    for (const auto& item : explanations) {
+        if (!item.would_run) {
+            continue;
+        }
+        for (const auto& reason : item.reasons) {
+            std::cout << "  - " << reason << " (" << item.id.value << ")\n";
+        }
+    }
+    return 0;
+}
+
+int cmd_clean(const ParsedArgs& args) {
+    Session session;
+    if (const auto err = load_session(session, args)) {
+        return fail(err->message);
+    }
+    const Path build_dir = session.build_dir();
+    const Path cache_dir = fs::join(session.config.root, ".luma");
+    fs::remove_all(build_dir);
+    fs::remove_all(cache_dir);
+    std::cout << "cleaned " << build_dir << " and " << cache_dir << '\n';
+    return 0;
 }
 
 } // namespace
 
 CommandResult run(int argc, char** argv) {
     if (argc < 2) {
-        print_usage();
-        return {0};
+        print_usage(std::cerr);
+        return {1};
     }
 
     const ParsedArgs args = parse_args(argc, argv);
-    if (args.command == "--help" || args.command == "-h") {
-        print_usage();
+    if (args.command == "--help" || args.command == "-h" || args.command == "help") {
+        print_usage(std::cout);
         return {0};
     }
-    if (args.command == "--version" || args.command == "-v") {
-        return cmd_version();
-    }
-
-    if (args.command == "graph") {
-        Session session;
-        if (const auto err = Session::load(session, session_options_from(args))) {
-            std::cerr << "error: " << err->message << '\n';
-            return {1};
-        }
-        if (args.graph_format == "dot") {
-            emit_dot(session.plan.graph);
-        } else {
-            std::cerr << "unsupported graph format: " << args.graph_format << '\n';
-            return {1};
-        }
+    if (args.command == "--version" || args.command == "-v" || args.command == "version") {
+        std::cout << "luma " << LUMA_VERSION << '\n';
         return {0};
     }
-
-    if (args.command == "inspect") {
-        if (args.inspect_target.empty()) {
-            std::cerr << "usage: luma inspect <target>\n";
-            return {1};
-        }
-        Session session;
-        if (const auto err = Session::load(session, session_options_from(args))) {
-            std::cerr << "error: " << err->message << '\n';
-            return {1};
-        }
-        inspect_target(session.config, args.inspect_target);
-        return {0};
-    }
-
-    if (args.command == "explain") {
-        if (args.explain_target.empty()) {
-            std::cerr << "usage: luma explain <target>\n";
-            return {1};
-        }
-        Session session;
-        if (const auto err = Session::load(session, session_options_from(args))) {
-            std::cerr << "error: " << err->message << '\n';
-            return {1};
-        }
-        cache::CacheStore cache(session.cache_dir);
-        cache.load();
-
-        const auto explanations =
-            executor::explain_target(session.plan, cache, args.explain_target, session.config.root);
-
-        bool would_rebuild = false;
-        for (const auto& item : explanations) {
-            if (item.would_run) {
-                would_rebuild = true;
-            }
-        }
-
-        if (!would_rebuild) {
-            std::cout << args.explain_target << " is up to date\n";
-            return {0};
-        }
-
-        std::cout << args.explain_target << " would rebuild because:\n";
-        for (const auto& item : explanations) {
-            if (!item.would_run) {
-                continue;
-            }
-            for (const auto& reason : item.reasons) {
-                std::cout << "  - " << reason << " (" << item.id.value << ")\n";
-            }
-        }
-        return {0};
-    }
-
-    if (args.command == "clean") {
-        Session session;
-        if (const auto err = Session::load(session, session_options_from(args))) {
-            std::cerr << "error: " << err->message << '\n';
-            return {1};
-        }
-        const Path build_dir = fs::join(session.config.root, session.config.build_dir);
-        const Path cache_dir = fs::join(session.config.root, ".luma");
-        fs::remove_all(build_dir);
-        fs::remove_all(cache_dir);
-        std::cout << "cleaned " << build_dir << " and " << cache_dir << '\n';
-        return {0};
+    if (!args.error.empty()) {
+        return {fail(args.error)};
     }
 
     if (args.command == "build") {
-        Session session;
-        if (const auto err = Session::load(session, session_options_from(args))) {
-            std::cerr << "error: " << err->message << '\n';
-            return {1};
-        }
-
-        cache::CacheStore cache(session.cache_dir);
-        cache.load();
-
-        executor::ExecutorOptions options{
-            .dry_run = args.dry_run,
-            .verbose = args.verbose,
-            .jobs = args.jobs,
-        };
-
-        const auto result = executor::execute(session.config, session.plan, cache, options);
-        if (result.exit_code != 0) {
-            return {result.exit_code};
-        }
-
-        if (args.verbose || args.dry_run) {
-            std::cout << "built " << result.tasks_run << " task(s), skipped " << result.tasks_skipped
-                      << '\n';
-        }
-        return {0};
+        return {cmd_build(args)};
+    }
+    if (args.command == "run") {
+        return {cmd_run(args)};
+    }
+    if (args.command == "targets") {
+        return {cmd_targets(args)};
+    }
+    if (args.command == "compdb") {
+        return {cmd_compdb(args)};
+    }
+    if (args.command == "init") {
+        return {cmd_init(args)};
+    }
+    if (args.command == "graph") {
+        return {cmd_graph(args)};
+    }
+    if (args.command == "inspect") {
+        return {cmd_inspect(args)};
+    }
+    if (args.command == "explain") {
+        return {cmd_explain(args)};
+    }
+    if (args.command == "clean") {
+        return {cmd_clean(args)};
     }
 
-    std::cerr << "unknown command: " << args.command << '\n';
-    print_usage();
+    std::cerr << "luma: error: unknown command: " << args.command << "\n\n";
+    print_usage(std::cerr);
     return {1};
 }
 
