@@ -52,19 +52,21 @@ bool is_table(lua_State* L, int index) {
     return lua_istable(L, index);
 }
 
+/// Read a string or an array of strings (in array order) at `index`.
 std::vector<std::string> read_string_array(lua_State* L, int index) {
     std::vector<std::string> values;
+    if (lua_type(L, index) == LUA_TSTRING) {
+        values.emplace_back(lua_tostring(L, index));
+        return values;
+    }
     if (!is_table(L, index)) {
         return values;
     }
 
-    if (lua_isstring(L, index)) {
-        values.emplace_back(lua_tostring(L, index));
-        return values;
-    }
-
-    lua_pushnil(L);
-    while (lua_next(L, index < 0 ? index - 1 : index) != 0) {
+    const int table = lua_absindex(L, index);
+    const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, table));
+    for (lua_Integer i = 1; i <= count; ++i) {
+        lua_rawgeti(L, table, i);
         if (lua_isstring(L, -1)) {
             values.emplace_back(lua_tostring(L, -1));
         }
@@ -135,9 +137,8 @@ int api_toolchain(lua_State* L) {
     if (toolchain.archiver.empty()) {
         toolchain.archiver = "ar";
     }
-    toolchain.languages = read_string_array(L, 2);
     lua_getfield(L, 2, "languages");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         toolchain.languages = read_string_array(L, -1);
     }
     lua_pop(L, 1);
@@ -169,27 +170,26 @@ int api_profile(lua_State* L) {
 
     ProfileDef profile;
     profile.name = name;
-    profile.defines = read_string_array(L, 2);
     lua_getfield(L, 2, "defines");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         profile.defines = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "cflags");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         profile.cflags = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "cxxflags");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         profile.cxxflags = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "linkflags");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         profile.linkflags = read_string_array(L, -1);
     }
     lua_pop(L, 1);
@@ -247,45 +247,44 @@ int api_target(lua_State* L) {
     }
     read_sources(L, 2, target);
 
-    target.include_dirs = read_path_array(L, 2);
     lua_getfield(L, 2, "include_dirs");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.include_dirs = read_path_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "defines");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.defines = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "cflags");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.cflags = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "cxxflags");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.cxxflags = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "linkflags");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.linkflags = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "dependencies");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.dependencies = read_string_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "system_libs");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         target.system_libs = read_string_array(L, -1);
     }
     lua_pop(L, 1);
@@ -323,13 +322,13 @@ int api_generate(lua_State* L) {
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "outputs");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         generator.outputs = read_path_array(L, -1);
     }
     lua_pop(L, 1);
 
     lua_getfield(L, 2, "command");
-    if (lua_istable(L, -1)) {
+    if (lua_istable(L, -1) || lua_type(L, -1) == LUA_TSTRING) {
         generator.command = read_string_array(L, -1);
     }
     lua_pop(L, 1);
@@ -468,27 +467,28 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
 
     if (out.profiles.empty()) {
         const ToolchainDef& toolchain = out.toolchains[out.active_toolchain];
+        ProfileDef debug;
+        debug.name = "debug";
+        debug.defines = {"DEBUG"};
+        ProfileDef release;
+        release.name = "release";
+        release.defines = {"NDEBUG"};
         if (toolchain.style == ToolchainStyle::Msvc) {
-            out.profiles["debug"] = ProfileDef{
-                .name = "debug",
-                .defines = {"DEBUG"},
-                .cxxflags = {"/Od", "/Zi", "/MDd", "/W4", "/std:c++20", "/EHsc"},
-            };
-            out.profiles["release"] = ProfileDef{
-                .name = "release",
-                .cxxflags = {"/O2", "/MD", "/W4", "/std:c++20", "/EHsc"},
-            };
+            // /Z7 keeps debug info in each object file, so parallel cl.exe
+            // processes never contend for a shared .pdb.
+            debug.cflags = {"/Od", "/Z7", "/MDd", "/W4"};
+            debug.cxxflags = {"/Od", "/Z7", "/MDd", "/W4", "/std:c++20"};
+            debug.linkflags = {"/DEBUG"};
+            release.cflags = {"/O2", "/MD", "/W4"};
+            release.cxxflags = {"/O2", "/MD", "/W4", "/std:c++20"};
         } else {
-            out.profiles["debug"] = ProfileDef{
-                .name = "debug",
-                .defines = {"DEBUG"},
-                .cxxflags = {"-O0", "-g", "-Wall", "-Wextra", "-std=c++20"},
-            };
-            out.profiles["release"] = ProfileDef{
-                .name = "release",
-                .cxxflags = {"-O3", "-Wall", "-Wextra", "-std=c++20"},
-            };
+            debug.cflags = {"-O0", "-g", "-Wall", "-Wextra"};
+            debug.cxxflags = {"-O0", "-g", "-Wall", "-Wextra", "-std=c++20"};
+            release.cflags = {"-O3", "-Wall", "-Wextra"};
+            release.cxxflags = {"-O3", "-Wall", "-Wextra", "-std=c++20"};
         }
+        out.profiles["debug"] = std::move(debug);
+        out.profiles["release"] = std::move(release);
     }
 
     return std::nullopt;

@@ -2,6 +2,9 @@
 
 #include "luma/executor/process.hpp"
 
+#include <mutex>
+#include <unordered_map>
+
 namespace luma::toolchain {
 
 namespace {
@@ -63,22 +66,42 @@ config::ToolchainDef detect_default() {
 }
 
 std::string identity_string(const config::ToolchainDef& toolchain) {
-    if (toolchain.style == ToolchainStyle::Msvc) {
-        const auto result = executor::run_process({toolchain.cxx});
-        if (!result.stderr_text.empty()) {
-            return result.stderr_text.substr(0, result.stderr_text.find('\n'));
+    // Probing the compiler spawns a process; remember the answer for the
+    // lifetime of this process.
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::string> known;
+    const std::string key = (toolchain.style == ToolchainStyle::Msvc ? "msvc:" : "gnu:") + toolchain.cxx;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto it = known.find(key); it != known.end()) {
+            return it->second;
         }
-        return "msvc-" + toolchain.cxx;
     }
 
-    const auto result = executor::run_process({toolchain.cxx, "--version"});
-    if (!result.stdout_text.empty()) {
-        return result.stdout_text.substr(0, result.stdout_text.find('\n'));
+    auto first_line = [](const std::string& text) {
+        std::string line = text.substr(0, text.find('\n'));
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        return line;
+    };
+
+    std::string version;
+    if (toolchain.style == ToolchainStyle::Msvc) {
+        // cl.exe prints its banner on stderr when run without arguments.
+        const auto result = executor::run_process({toolchain.cxx});
+        version = first_line(!result.stderr_text.empty() ? result.stderr_text : result.stdout_text);
+    } else {
+        const auto result = executor::run_process({toolchain.cxx, "--version"});
+        if (result.exit_code == 0) {
+            version = first_line(!result.stdout_text.empty() ? result.stdout_text : result.stderr_text);
+        }
     }
-    if (!result.stderr_text.empty()) {
-        return result.stderr_text.substr(0, result.stderr_text.find('\n'));
-    }
-    return toolchain.cxx;
+
+    const std::string identity = version.empty() ? toolchain.cxx : toolchain.cxx + " " + version;
+    std::lock_guard lock(mutex);
+    known[key] = identity;
+    return identity;
 }
 
 } // namespace luma::toolchain

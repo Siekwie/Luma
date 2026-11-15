@@ -3,16 +3,21 @@
 #include "luma/filesystem/path_util.hpp"
 
 #include <algorithm>
-#include <filesystem>
 #include <regex>
 #include <sstream>
-
-namespace fs = std::filesystem;
 
 namespace luma::fs {
 
 namespace {
 
+bool has_wildcard(const std::string& segment) {
+    return segment.find_first_of("*?[") != std::string::npos;
+}
+
+/// Translate a glob into an ECMAScript regex matched against '/'-separated
+/// paths relative to the project root:
+///   `**/` matches zero or more directories, `**` anything,
+///   `*` anything except '/', `?` one character except '/'.
 std::string glob_to_regex(const std::string& pattern) {
     std::ostringstream out;
     out << '^';
@@ -20,20 +25,20 @@ std::string glob_to_regex(const std::string& pattern) {
         const char c = pattern[i];
         if (c == '*') {
             if (i + 1 < pattern.size() && pattern[i + 1] == '*') {
-                out << ".*";
                 ++i;
                 if (i + 1 < pattern.size() && pattern[i + 1] == '/') {
                     ++i;
+                    out << "(?:.*/)?";
+                } else {
+                    out << ".*";
                 }
             } else {
                 out << "[^/]*";
             }
         } else if (c == '?') {
             out << "[^/]";
-        } else if (c == '.') {
-            out << "\\.";
-        } else if (c == '\\' || c == '+' || c == '(' || c == ')' || c == '|' || c == '^' || c == '$' ||
-                   c == '[' || c == ']' || c == '{') {
+        } else if (c == '.' || c == '\\' || c == '+' || c == '(' || c == ')' || c == '|' ||
+                   c == '^' || c == '$' || c == '[' || c == ']' || c == '{' || c == '}') {
             out << '\\' << c;
         } else {
             out << c;
@@ -47,35 +52,49 @@ std::string glob_to_regex(const std::string& pattern) {
 
 std::vector<Path> glob(const Path& root, const std::string& pattern) {
     const std::string normalized_pattern = normalize(pattern);
-    const auto recursive = normalized_pattern.find("/**/");
 
-    std::string search_root = root;
-    std::string relative_pattern = normalized_pattern;
-
-    if (recursive != std::string::npos) {
-        const std::string prefix = normalized_pattern.substr(0, recursive);
-        search_root = prefix.empty() ? root : join(root, prefix);
-        relative_pattern = normalized_pattern.substr(recursive + 4);
+    // Walk only the longest literal directory prefix of the pattern.
+    std::string literal_prefix;
+    {
+        std::size_t start = 0;
+        while (true) {
+            const std::size_t slash = normalized_pattern.find('/', start);
+            if (slash == std::string::npos) {
+                break;
+            }
+            const std::string segment = normalized_pattern.substr(start, slash - start);
+            if (has_wildcard(segment)) {
+                break;
+            }
+            literal_prefix = normalized_pattern.substr(0, slash);
+            start = slash + 1;
+        }
     }
 
-    const std::regex matcher(glob_to_regex(relative_pattern), std::regex::icase);
     std::vector<Path> matches;
-
-    if (!exists(search_root)) {
+    if (!has_wildcard(normalized_pattern)) {
+        if (is_regular_file(join(root, normalized_pattern))) {
+            matches.push_back(normalized_pattern);
+        }
         return matches;
     }
 
-    const auto files = list_files_recursive(search_root);
-    for (const auto& file : files) {
-        Path rel = relative_to(file, root);
-        if (recursive != std::string::npos) {
-            const std::string prefix = normalized_pattern.substr(0, recursive);
-            if (!prefix.empty()) {
-                rel = relative_to(file, search_root);
-            }
-        }
+    const Path search_root = literal_prefix.empty() ? root : join(root, literal_prefix);
+    if (!is_directory(search_root)) {
+        return matches;
+    }
+
+#ifdef _WIN32
+    const auto flags = std::regex::ECMAScript | std::regex::icase;
+#else
+    const auto flags = std::regex::ECMAScript;
+#endif
+    const std::regex matcher(glob_to_regex(normalized_pattern), flags);
+
+    for (const auto& file : list_files_recursive(search_root)) {
+        const Path rel = relative_to(file, root);
         if (std::regex_match(rel, matcher)) {
-            matches.push_back(relative_to(file, root));
+            matches.push_back(rel);
         }
     }
 
