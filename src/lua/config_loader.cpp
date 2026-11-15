@@ -110,6 +110,27 @@ ToolchainStyle read_toolchain_style(const std::string& style, const std::string&
     return ToolchainStyle::Gnu;
 }
 
+/// Support the call-chaining form `target "name" { ... }`: when a
+/// declaration is called with only a name, return a function that takes
+/// the table.
+template <lua_CFunction Declaration>
+int curried_declaration(lua_State* L) {
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    return Declaration(L);
+}
+
+template <lua_CFunction Declaration>
+bool return_curried(lua_State* L) {
+    if (lua_gettop(L) != 1) {
+        return false;
+    }
+    luaL_checkstring(L, 1);
+    lua_pushvalue(L, 1);
+    lua_pushcclosure(L, curried_declaration<Declaration>, 1);
+    return true;
+}
+
 int api_project(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     if (auto* ctx = state(L)) {
@@ -119,6 +140,9 @@ int api_project(lua_State* L) {
 }
 
 int api_toolchain(lua_State* L) {
+    if (return_curried<api_toolchain>(L)) {
+        return 1;
+    }
     const char* name = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
 
@@ -165,6 +189,9 @@ int api_toolchain(lua_State* L) {
 }
 
 int api_profile(lua_State* L) {
+    if (return_curried<api_profile>(L)) {
+        return 1;
+    }
     const char* name = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
 
@@ -235,6 +262,9 @@ void read_sources(lua_State* L, int index, TargetDef& target) {
 }
 
 int api_target(lua_State* L) {
+    if (return_curried<api_target>(L)) {
+        return 1;
+    }
     const char* name = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
 
@@ -296,6 +326,9 @@ int api_target(lua_State* L) {
 }
 
 int api_generate(lua_State* L) {
+    if (return_curried<api_generate>(L)) {
+        return 1;
+    }
     const char* name = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
 
