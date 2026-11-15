@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <mutex>
