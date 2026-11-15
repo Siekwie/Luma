@@ -41,6 +41,7 @@ public:
     /// Write the manifest atomically and drop the journal.
     bool save();
     bool load();
+    const Path& dir() const { return cache_dir_; }
 
 private:
     Path cache_dir_;

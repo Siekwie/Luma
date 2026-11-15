@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# A build tool should be fast by default: single-config generators without an explicit
+# CMAKE_BUILD_TYPE get an optimized build (hashing and graph work are hot paths).
+get_property(LUMA_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT LUMA_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 include(cmake/Lua.cmake)
 
 set(LUMA_CORE_SOURCES

@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -32,10 +33,17 @@ std::string metadata_value(const graph::Task& task, const char* key) {
     return it == task.metadata.end() ? std::string{} : it->second;
 }
 
-/// Memoizes content hashes of discovered dependencies (headers): many
-/// translation units include the same files.
+/// Content hashes of inputs and discovered dependencies (headers), memoized
+/// within a build (many translation units include the same files) and, with a
+/// stat file, across builds: a file whose size and modification time match
+/// what was recorded is not read again. Like git's "racy" rule, a hash is only
+/// reused when it was taken at least 2 s after the file's last modification,
+/// so an edit within the same timestamp tick is never missed.
 class HashMemo {
 public:
+    HashMemo() = default;
+    explicit HashMemo(Path stat_file) : stat_file_(std::move(stat_file)) { load(); }
+
     std::optional<Hash> hash(const Path& path) {
         {
             std::lock_guard lock(mutex_);
@@ -44,7 +52,30 @@ public:
                 return it->second;
             }
         }
-        auto value = fs::hash_file(path);
+        std::optional<Hash> value;
+        std::error_code ec;
+        const auto fs_path = fs::to_fs_path(path);
+        const auto size = std::filesystem::file_size(fs_path, ec);
+        const bool have_stat = !ec;
+        const auto mtime = have_stat ? std::filesystem::last_write_time(fs_path, ec) : std::filesystem::file_time_type{};
+        const std::int64_t mtime_ns = (have_stat && !ec) ? ticks(mtime) : 0;
+        if (have_stat && !ec && !stat_file_.empty()) {
+            std::lock_guard lock(mutex_);
+            const auto it = stats_.find(path);
+            if (it != stats_.end() && it->second.size == size && it->second.mtime == mtime_ns &&
+                it->second.hashed_at - mtime_ns >= kRacyWindow) {
+                value = it->second.hash;
+            }
+        }
+        if (!value) {
+            const auto hashed_at = ticks(std::filesystem::file_time_type::clock::now());
+            value = fs::hash_file(path);
+            if (value && have_stat && !ec && !stat_file_.empty()) {
+                std::lock_guard lock(mutex_);
+                stats_[path] = Stat{static_cast<std::uint64_t>(size), mtime_ns, hashed_at, *value};
+                dirty_ = true;
+            }
+        }
         std::lock_guard lock(mutex_);
         hashes_[path] = value;
         return value;
@@ -55,9 +86,78 @@ public:
         hashes_.erase(path);
     }
 
+    /// Persists the stat cache (atomically). Entries of files that no longer
+    /// exist are dropped.
+    void save() {
+        std::lock_guard lock(mutex_);
+        if (stat_file_.empty() || !dirty_) {
+            return;
+        }
+        const Path temp = stat_file_ + ".tmp";
+        {
+            std::ofstream out(fs::to_fs_path(temp), std::ios::binary | std::ios::trunc);
+            if (!out) {
+                return;
+            }
+            for (const auto& [path, st] : stats_) {
+                out << st.size << '\t' << st.mtime << '\t' << st.hashed_at << '\t' << st.hash << '\t' << path << '\n';
+            }
+            if (!out.flush()) {
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(fs::to_fs_path(temp), fs::to_fs_path(stat_file_), ec);
+        dirty_ = false;
+    }
+
 private:
+    struct Stat {
+        std::uint64_t size = 0;
+        std::int64_t mtime = 0, hashed_at = 0;
+        Hash hash;
+    };
+    static std::int64_t ticks(std::filesystem::file_time_type t) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+    }
+    static constexpr std::int64_t kRacyWindow = 2'000'000'000;  // 2 s in ns
+
+    void load() {
+        std::ifstream in(fs::to_fs_path(stat_file_), std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            // size \t mtime \t hashed_at \t hash \t path   (the path may contain tabs: it is last)
+            std::size_t p[4];
+            std::size_t at = 0;
+            bool ok = true;
+            for (auto& q : p) {
+                q = line.find('\t', at);
+                if (q == std::string::npos) {
+                    ok = false;
+                    break;
+                }
+                at = q + 1;
+            }
+            if (!ok) {
+                continue;
+            }
+            try {
+                Stat st;
+                st.size = std::stoull(line.substr(0, p[0]));
+                st.mtime = std::stoll(line.substr(p[0] + 1, p[1] - p[0] - 1));
+                st.hashed_at = std::stoll(line.substr(p[1] + 1, p[2] - p[1] - 1));
+                st.hash = line.substr(p[2] + 1, p[3] - p[2] - 1);
+                stats_[line.substr(p[3] + 1)] = std::move(st);
+            } catch (...) {
+            }
+        }
+    }
+
     std::mutex mutex_;
     std::unordered_map<Path, std::optional<Hash>> hashes_;
+    Path stat_file_;
+    std::unordered_map<Path, Stat> stats_;
+    bool dirty_ = false;
 };
 
 struct TaskStatus {
@@ -77,7 +177,7 @@ TaskStatus evaluate_task(
 
     std::vector<Hash> input_hashes;
     for (const auto& input : task.inputs) {
-        if (const auto hash = fs::hash_file(fs::join(root, input))) {
+        if (const auto hash = memo.hash(fs::join(root, input))) {
             status.input_hashes[input] = *hash;
             input_hashes.push_back(*hash);
         } else {
@@ -399,7 +499,8 @@ ExecuteResult execute(
         return result;
     }
 
-    HashMemo memo;
+    // Hashes persist across builds (stat-checked); a dry run only reads them.
+    HashMemo memo(fs::join(cache.dir(), "hashes.txt"));
 
     // A task runs if it is out of date itself or if anything it depends on
     // runs. Deciding this up front gives a fixed task count for progress.
@@ -471,6 +572,7 @@ ExecuteResult execute(
     result.exit_code = result.cancelled ? cancellation_exit_code() : (sched.failed ? 1 : 0);
 
     if (!options.dry_run) {
+        memo.save();
         cache.save();
     }
     return result;
@@ -487,7 +589,7 @@ std::vector<TaskExplanation> explain_target(
         return explanations;
     }
 
-    HashMemo memo;
+    HashMemo memo(fs::join(cache.dir(), "hashes.txt"));  // read-only here
     for (const auto& task_id : it->second) {
         const graph::Task* task = plan.graph.find_task(task_id);
         if (!task) {
