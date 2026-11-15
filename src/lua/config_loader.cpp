@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "luma/lua/config_loader.hpp"
 
 #include "luma/executor/process.hpp"
@@ -222,6 +223,7 @@ int api_profile(lua_State* L) {
     lua_pop(L, 1);
 
     profile.lto = read_bool_field(L, 2, "lto", false);
+    profile.inherit = read_bool_field(L, 2, "inherit", true);
 
     if (auto* ctx = state(L)) {
         ctx->project->profiles[name] = std::move(profile);
@@ -498,7 +500,7 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
         out.active_toolchain = "auto";
     }
 
-    if (out.profiles.empty()) {
+    {
         const ToolchainDef& toolchain = out.toolchains[out.active_toolchain];
         ProfileDef debug;
         debug.name = "debug";
@@ -520,8 +522,38 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
             release.cflags = {"-O3", "-Wall", "-Wextra"};
             release.cxxflags = {"-O3", "-Wall", "-Wextra", "-std=c++20"};
         }
-        out.profiles["debug"] = std::move(debug);
-        out.profiles["release"] = std::move(release);
+        // Built-in profiles: added when missing, used as the base of user profiles
+        // with the same name (user flags come last, so they win), unless `inherit = false`.
+        auto merge = [](ProfileDef base, const ProfileDef& user) {
+            if (!user.inherit) return user;
+            auto append = [](std::vector<std::string>& to, const std::vector<std::string>& from) {
+                for (const auto& f : from) {
+                    if (std::find(to.begin(), to.end(), f) == to.end()) to.push_back(f);
+                }
+            };
+            append(base.defines, user.defines);
+            append(base.cflags, user.cflags);
+            append(base.cxxflags, user.cxxflags);
+            append(base.linkflags, user.linkflags);
+            base.lto = user.lto;
+            base.inherit = true;
+            return base;
+        };
+        for (ProfileDef* builtin : {&debug, &release}) {
+            auto it = out.profiles.find(builtin->name);
+            if (it == out.profiles.end()) {
+                // Only add missing built-ins when the project declared no profiles at all,
+                // so a project that defines e.g. only "dev" keeps exactly that.
+                bool anyUser = false;
+                for (const auto& [n, p] : out.profiles) {
+                    (void)p;
+                    if (n != "debug" && n != "release") anyUser = true;
+                }
+                if (!anyUser) out.profiles[builtin->name] = *builtin;
+            } else {
+                it->second = merge(*builtin, it->second);
+            }
+        }
     }
 
     return std::nullopt;

@@ -95,8 +95,13 @@ else the first profile by name. An unknown `--profile` is an error that
 lists the available profiles. If `luma.lua` declares no profiles, Luma
 provides `debug` and `release` with flags for the detected toolchain
 (`-O0 -g -Wall -Wextra` / `-O3 ...` plus `-std=c++20` for C++; MSVC:
-`/Od /Z7 /MDd /W4` / `/O2 /MD /W4` plus `/std:c++20`). Declaring any profile
-replaces these defaults.
+`/Od /Z7 /MDd /W4` / `/O2 /MD /W4` plus `/std:c++20`).
+
+A profile you declare under one of those names starts from the built-in
+defaults and adds its own defines and flags after them (later flags win, so
+`cxxflags = { "-O2" }` in `debug` overrides `-O0`). Write `inherit = false`
+to start from nothing. A project that declares only profiles with other names
+(e.g. `dev`) gets exactly those.
 
 All profiles share the build directory, so switching profiles rebuilds what
 changed.
