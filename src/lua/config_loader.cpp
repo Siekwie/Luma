@@ -1,4 +1,3 @@
-#include <algorithm>
 #include "luma/lua/config_loader.hpp"
 
 #include "luma/executor/process.hpp"
@@ -11,10 +10,13 @@ extern "C" {
 #include "lualib.h"
 }
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -237,7 +239,14 @@ int api_profile(lua_State* L) {
     lua_pop(L, 1);
 
     profile.lto = read_bool_field(L, 2, "lto", false);
-    profile.inherit = read_bool_field(L, 2, "inherit", true);
+    lua_getfield(L, 2, "inherit");
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        profile.inherit_from = lua_tostring(L, -1);
+        profile.inherit = true;
+    } else if (lua_isboolean(L, -1)) {
+        profile.inherit = lua_toboolean(L, -1) != 0;
+    }
+    lua_pop(L, 1);
 
     if (auto* ctx = state(L)) {
         ctx->project->profiles[name] = std::move(profile);
@@ -609,6 +618,7 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
         };
         for (ProfileDef* builtin : {&debug, &release}) {
             auto it = out.profiles.find(builtin->name);
+            if (it != out.profiles.end() && !it->second.inherit_from.empty()) continue;  // resolved below
             if (it == out.profiles.end()) {
                 // Only add missing built-ins when the project declared no profiles at all,
                 // so a project that defines e.g. only "dev" keeps exactly that.
@@ -622,6 +632,43 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
                 it->second = merge(*builtin, it->second);
             }
         }
+
+        // Named inheritance (`inherit = "debug"`), resolved parent-first; chains allowed, cycles not.
+        std::map<std::string, int> state;  // 1 = resolving, 2 = done
+        std::optional<std::string> err;
+        std::function<void(const std::string&)> resolve = [&](const std::string& name) {
+            if (err || state[name] == 2) return;
+            ProfileDef& p = out.profiles[name];
+            if (p.inherit_from.empty()) {
+                state[name] = 2;
+                return;
+            }
+            if (state[name] == 1) {
+                err = "profile '" + name + "' inherits from itself (through '" + p.inherit_from + "')";
+                return;
+            }
+            state[name] = 1;
+            const std::string parent = p.inherit_from;
+            if (!out.profiles.count(parent)) {
+                const bool builtinName = parent == "debug" || parent == "release";
+                if (!builtinName) {
+                    err = "profile '" + name + "' inherits from unknown profile '" + parent + "'";
+                    return;
+                }
+                out.profiles[parent] = parent == "debug" ? debug : release;  // e.g. only "asan" declared
+            }
+            resolve(parent);
+            if (err) return;
+            ProfileDef merged = merge(out.profiles[parent], p);
+            merged.name = name;
+            merged.inherit_from.clear();
+            out.profiles[name] = std::move(merged);
+            state[name] = 2;
+        };
+        std::vector<std::string> names;
+        for (const auto& [n, p] : out.profiles) names.push_back(n);
+        for (const auto& n : names) resolve(n);
+        if (err) return LoadError{*err};
     }
 
     return std::nullopt;

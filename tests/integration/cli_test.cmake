@@ -355,6 +355,52 @@ if(NOT (code EQUAL 0 AND out MATCHES "value 1"))
     fail("build after a killed build recovers")
 endif()
 
+# --- profiles: inherit = "<profile>" (chains), unknown parent and cycles are errors
+set(prof "${WORK_DIR}/prof")
+file(MAKE_DIRECTORY "${prof}/src")
+file(WRITE "${prof}/src/main.cpp" "int main() { return 0; }\n")
+file(WRITE "${prof}/luma.lua" [=[
+project "prof"
+target "app" { kind = "executable", sources = { "src/main.cpp" } }
+profile "debug" { defines = { "MYDEBUG" } }
+profile "asan" { inherit = "debug", cxxflags = { "-fsanitize=address" }, linkflags = { "-fsanitize=address" } }
+profile "asan2" { inherit = "asan", defines = { "EXTRA" } }
+]=])
+run_luma("${prof}" out code compdb --profile asan2)
+file(READ "${prof}/compile_commands.json" compdb)
+if(NOT (code EQUAL 0 AND compdb MATCHES "-O0" AND compdb MATCHES "MYDEBUG" AND compdb MATCHES "-fsanitize=address" AND compdb MATCHES "EXTRA"))
+    fail("inherit = \"asan\" chains through asan to debug and the built-in defaults")
+endif()
+file(WRITE "${prof}/luma.lua" [=[
+project "prof"
+target "app" { kind = "executable", sources = { "src/main.cpp" } }
+profile "asan" { inherit = "debug", cxxflags = { "-fsanitize=address" } }
+]=])
+run_luma("${prof}" out code compdb --profile asan)
+file(READ "${prof}/compile_commands.json" compdb)
+if(NOT (code EQUAL 0 AND compdb MATCHES "-g" AND compdb MATCHES "-fsanitize=address"))
+    fail("inherit = \"debug\" works when debug itself is not declared")
+endif()
+file(WRITE "${prof}/luma.lua" [=[
+project "prof"
+target "app" { kind = "executable", sources = { "src/main.cpp" } }
+profile "a" { inherit = "b" }
+profile "b" { inherit = "a" }
+]=])
+execute_process(COMMAND "${LUMA}" targets WORKING_DIRECTORY "${prof}" OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE code)
+if(code EQUAL 0 OR NOT (err MATCHES "inherits from itself"))
+    fail("profile inheritance cycle is an error (got: ${err})")
+endif()
+file(WRITE "${prof}/luma.lua" [=[
+project "prof"
+target "app" { kind = "executable", sources = { "src/main.cpp" } }
+profile "a" { inherit = "nope" }
+]=])
+execute_process(COMMAND "${LUMA}" targets WORKING_DIRECTORY "${prof}" OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE code)
+if(code EQUAL 0 OR NOT (err MATCHES "unknown profile 'nope'"))
+    fail("inheriting from an unknown profile is an error (got: ${err})")
+endif()
+
 if(failures GREATER 0)
     message(FATAL_ERROR "${failures} check(s) failed")
 endif()

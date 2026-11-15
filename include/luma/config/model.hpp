@@ -33,6 +33,9 @@ struct ProfileDef {
     // defaults (-O0 -g / -O3, warnings, C++20) and append this profile's settings.
     // Set `inherit = false` in luma.lua to start from nothing.
     bool inherit = true;
+    // `inherit = "debug"`: start from another profile (after its own inheritance) and append
+    // this profile's settings, e.g. an "asan" profile that is debug plus -fsanitize flags.
+    std::string inherit_from;
 };
 
 struct GenerateDef {

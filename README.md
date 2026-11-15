@@ -103,6 +103,19 @@ defaults and adds its own defines and flags after them (later flags win, so
 to start from nothing. A project that declares only profiles with other names
 (e.g. `dev`) gets exactly those.
 
+`inherit = "<profile>"` starts a profile from another one (after that one's own
+inheritance) and appends its settings — the usual way to add sanitizer builds:
+
+```lua
+profile "asan" {
+    inherit = "debug",
+    cxxflags = { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" },
+    linkflags = { "-fsanitize=address,undefined" },
+}
+```
+
+Chains are fine; a cycle or an unknown parent is an error.
+
 All profiles share the build directory, so switching profiles rebuilds what
 changed.
 
