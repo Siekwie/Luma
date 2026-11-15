@@ -7,6 +7,7 @@
 #include "luma/graph/task.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -186,6 +187,7 @@ struct RunContext {
     std::size_t tasks_run = 0;
     std::size_t tasks_skipped = 0;
     std::size_t tasks_failed = 0;
+    std::vector<TaskTiming> timings;
 };
 
 /// Print one task's progress block atomically.
@@ -231,6 +233,13 @@ bool run_task(RunContext& ctx, const graph::Task& task) {
     const TaskStatus status =
         evaluate_task(task, previous ? &*previous : nullptr, ctx.plan, root, ctx.memo);
 
+    // Record (durably, via the cache journal) that this task's outputs are
+    // about to change, so an interrupted build reruns it next time.
+    {
+        std::lock_guard lock(ctx.cache_mutex);
+        ctx.cache.invalidate(task.id);
+    }
+
     for (const auto& output : task.outputs) {
         const Path output_path = fs::join(root, output);
         // Never let a stale output survive a failed or partial run (and keep
@@ -241,7 +250,10 @@ bool run_task(RunContext& ctx, const graph::Task& task) {
     }
 
     const std::string cwd = task.working_directory ? *task.working_directory : root;
+    const auto started = std::chrono::steady_clock::now();
     const ProcessResult process = run_process(task.command, cwd, /*merge_output=*/true);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
 
     const std::string deps_format = metadata_value(task, meta::kDepsFormat);
     std::string output = process.stdout_text;
@@ -257,8 +269,24 @@ bool run_task(RunContext& ctx, const graph::Task& task) {
 
     const bool ok = process.exit_code == 0;
     report(ctx, task, output);
+    {
+        std::string verb = metadata_value(task, meta::kVerb);
+        std::string description = metadata_value(task, meta::kDescription);
+        std::lock_guard lock(ctx.log_mutex);
+        ctx.timings.push_back(TaskTiming{
+            .id = task.id.value,
+            .verb = verb.empty() ? "run" : verb,
+            .description = description.empty() ? task.id.value : description,
+            .output = task.outputs.empty() ? Path{} : fs::join(root, task.outputs.front()),
+            .ms = static_cast<std::int64_t>(elapsed_ms),
+            .ok = ok,
+        });
+    }
 
     if (!ok) {
+        if (cancellation_requested()) {
+            return false; // killed by us; not worth an error report
+        }
         std::lock_guard lock(ctx.log_mutex);
         std::cerr << "luma: error: task '" << task.id.value << "' failed with exit code "
                   << process.exit_code << "\n  command: " << format_command(task.command) << '\n'
@@ -305,6 +333,9 @@ void worker_loop(Scheduler& sched, RunContext& ctx) {
             sched.cv.wait(lock, [&]() {
                 return (!sched.ready.empty() && !sched.failed) || sched.in_flight == 0;
             });
+            if (cancellation_requested()) {
+                sched.failed = true;
+            }
             if (sched.failed || sched.ready.empty()) {
                 // Either everything reachable has finished, or a task failed
                 // and no new work may start.
@@ -413,6 +444,14 @@ ExecuteResult execute(
 
     RunContext ctx(config, plan, cache, options, planned, planned_total, memo);
 
+    // Turn Ctrl+C / SIGTERM into an orderly shutdown that still saves the
+    // cache, and journal cache updates so even SIGKILL cannot corrupt it.
+    std::optional<CancellationScope> cancellation;
+    if (!options.dry_run) {
+        cancellation.emplace();
+        cache.begin_journal();
+    }
+
     std::vector<std::thread> workers;
     const std::size_t worker_count = std::min(jobs, std::max<std::size_t>(1, planned_total));
     workers.reserve(worker_count);
@@ -426,7 +465,9 @@ ExecuteResult execute(
     result.tasks_run = ctx.tasks_run;
     result.tasks_skipped = ctx.tasks_skipped;
     result.tasks_failed = ctx.tasks_failed;
-    result.exit_code = sched.failed ? 1 : 0;
+    result.timings = std::move(ctx.timings);
+    result.cancelled = cancellation_requested();
+    result.exit_code = result.cancelled ? cancellation_exit_code() : (sched.failed ? 1 : 0);
 
     if (!options.dry_run) {
         cache.save();

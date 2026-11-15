@@ -1,3 +1,5 @@
+#include "luma/cache/cache_store.hpp"
+#include "luma/cli/introspect.hpp"
 #include "luma/config/graph_builder.hpp"
 #include "luma/executor/depfile.hpp"
 #include "luma/filesystem/glob.hpp"
@@ -278,6 +280,82 @@ static void test_build_plan_languages_and_outputs() {
     CHECK(config::build_plan(cfg, partial, {"nope"}).has_value());
 }
 
+static void test_cache_journal() {
+    TempProject project;
+    const Path dir = project.path() + "/cache";
+    const graph::TaskId a{"compile:a"};
+    const graph::TaskId b{"compile:b"};
+    const graph::TaskId c{"compile:c"};
+
+    {
+        cache::CacheStore store(dir);
+        store.put(a, cache::TaskCacheEntry{.cache_key = "ka", .input_hashes = {{"a.cpp", "ha"}}, .discovered_hashes = {}});
+        store.put(c, cache::TaskCacheEntry{.cache_key = "kc", .input_hashes = {}, .discovered_hashes = {}});
+        CHECK(store.save());
+    }
+    {
+        // A build that is killed: a started, b finished, c started and its
+        // completion record cut short.
+        cache::CacheStore store(dir);
+        CHECK(store.load());
+        CHECK(store.begin_journal());
+        store.invalidate(a);
+        store.invalidate(b);
+        store.put(b, cache::TaskCacheEntry{.cache_key = "kb", .input_hashes = {}, .discovered_hashes = {{"x.hpp", "hx"}}});
+        store.invalidate(c);
+    }
+    {
+        std::ofstream journal(std::filesystem::path(dir) / "journal.txt", std::ios::app | std::ios::binary);
+        journal << "[task:compile:c]\ncache_key=kc2\n"; // no "end": incomplete
+    }
+    {
+        cache::CacheStore store(dir);
+        CHECK(store.load());
+        CHECK(store.get(a) == nullptr);
+        CHECK(store.get(c) == nullptr);
+        const cache::TaskCacheEntry* entry = store.get(b);
+        CHECK(entry != nullptr);
+        if (entry) {
+            CHECK_EQ(entry->cache_key, std::string("kb"));
+            CHECK_EQ(entry->discovered_hashes.at("x.hpp"), std::string("hx"));
+        }
+        CHECK(store.save());
+        CHECK(!std::filesystem::exists(std::filesystem::path(dir) / "journal.txt"));
+    }
+    {
+        cache::CacheStore store(dir);
+        CHECK(store.load());
+        CHECK(store.get(b) != nullptr);
+        CHECK(store.get(a) == nullptr);
+    }
+}
+
+static void test_timings() {
+    const std::vector<executor::TaskTiming> timings = {
+        {.id = "link:app", .verb = "link", .description = "build/app", .output = "/r/build/app", .ms = 5, .ok = true},
+        {.id = "compile:app:a.cpp", .verb = "compile", .description = "a.cpp", .output = "/r/a.o", .ms = 90, .ok = true},
+    };
+    CHECK_EQ(cli::timings_json(100, timings),
+             std::string(R"({"total_ms":100,"tasks":[{"id":"compile:app:a.cpp","verb":"compile","desc":"a.cpp","ms":90,"output":"/r/a.o","ok":true},)"
+                         R"({"id":"link:app","verb":"link","desc":"build/app","ms":5,"output":"/r/build/app","ok":true}]})"));
+
+    TempProject project;
+    const Path log = project.path() + "/.luma/timings.jsonl";
+    for (int i = 0; i < 55; ++i) {
+        CHECK(cli::append_timings_log(log, 1000 + i, "debug", "succeeded", i, timings));
+    }
+    std::ifstream in(log);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(in, line);) {
+        lines.push_back(line);
+    }
+    CHECK_EQ(lines.size(), std::size_t{50});
+    if (!lines.empty()) {
+        CHECK(lines.front().starts_with(R"({"timestamp":1005,"profile":"debug","status":"succeeded","total_ms":5,"tasks":[)"));
+        CHECK(lines.back().starts_with(R"({"timestamp":1054,)"));
+    }
+}
+
 int main() {
     test_sha256();
     test_json();
@@ -286,6 +364,8 @@ int main() {
     test_paths();
     test_glob();
     test_build_plan_languages_and_outputs();
+    test_cache_journal();
+    test_timings();
 
     if (failures != 0) {
         std::cerr << failures << " check(s) failed\n";

@@ -29,6 +29,26 @@ int run_process_interactive(
     const std::vector<std::string>& command,
     const std::string& working_directory = {});
 
+/// While alive, SIGINT/SIGTERM/SIGHUP (POSIX) or console Ctrl+C/Break/Close
+/// (Windows) request cancellation instead of killing luma outright: running
+/// children started by run_process() are terminated, no new ones start, and
+/// cancellation_requested() becomes true so the caller can shut down cleanly
+/// (and persist its cache). A second signal terminates immediately.
+/// On Windows, children are additionally placed in a job object that kills
+/// them if luma itself is terminated.
+class CancellationScope {
+public:
+    CancellationScope();
+    ~CancellationScope();
+    CancellationScope(const CancellationScope&) = delete;
+    CancellationScope& operator=(const CancellationScope&) = delete;
+};
+
+bool cancellation_requested();
+
+/// Exit code to use after a cancellation (128 + signal number; 130 on Windows).
+int cancellation_exit_code();
+
 /// Human-readable command line (arguments with spaces are quoted).
 std::string format_command(const std::vector<std::string>& command);
 

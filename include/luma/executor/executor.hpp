@@ -4,6 +4,7 @@
 #include "luma/config/graph_builder.hpp"
 #include "luma/config/model.hpp"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,6 +25,16 @@ struct TaskExplanation {
     std::vector<std::string> reasons;
 };
 
+struct TaskTiming {
+    std::string id;
+    std::string verb;
+    std::string description;
+    /// Absolute path of the task's first output.
+    Path output;
+    std::int64_t ms = 0;
+    bool ok = true;
+};
+
 struct ExecuteResult {
     int exit_code = 0;
     /// Tasks that were executed (or would be, for a dry run).
@@ -32,6 +43,10 @@ struct ExecuteResult {
     std::size_t tasks_skipped = 0;
     /// Tasks whose command failed.
     std::size_t tasks_failed = 0;
+    /// True when the build was interrupted (SIGINT/SIGTERM/Ctrl+C).
+    bool cancelled = false;
+    /// One entry per executed task, in completion order.
+    std::vector<TaskTiming> timings;
     std::vector<TaskExplanation> explanations;
 };
 

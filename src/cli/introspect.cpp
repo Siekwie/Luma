@@ -81,7 +81,80 @@ std::string read_file(const Path& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+std::vector<executor::TaskTiming> by_duration(std::vector<executor::TaskTiming> timings) {
+    std::stable_sort(timings.begin(), timings.end(), [](const auto& a, const auto& b) {
+        return a.ms != b.ms ? a.ms > b.ms : a.id < b.id;
+    });
+    return timings;
+}
+
+void write_timing_tasks(JsonWriter& json, const std::vector<executor::TaskTiming>& timings) {
+    json.key("tasks").begin_array();
+    for (const auto& timing : by_duration(timings)) {
+        json.begin_object();
+        json.field("id", timing.id);
+        json.field("verb", timing.verb);
+        json.field("desc", timing.description);
+        json.key("ms").value(timing.ms);
+        json.field("output", timing.output);
+        json.field("ok", timing.ok);
+        json.end_object();
+    }
+    json.end_array();
+}
+
 } // namespace
+
+std::string timings_json(std::int64_t total_ms, const std::vector<executor::TaskTiming>& timings) {
+    JsonWriter json;
+    json.begin_object();
+    json.key("total_ms").value(total_ms);
+    write_timing_tasks(json, timings);
+    json.end_object();
+    return json.str();
+}
+
+bool append_timings_log(
+    const Path& path,
+    std::int64_t unix_timestamp,
+    const std::string& profile,
+    const std::string& status,
+    std::int64_t total_ms,
+    const std::vector<executor::TaskTiming>& timings,
+    std::size_t keep) {
+    JsonWriter json;
+    json.begin_object();
+    json.key("timestamp").value(unix_timestamp);
+    json.field("profile", profile);
+    json.field("status", status);
+    json.key("total_ms").value(total_ms);
+    write_timing_tasks(json, timings);
+    json.end_object();
+
+    std::vector<std::string> lines;
+    {
+        std::istringstream existing(read_file(path));
+        std::string line;
+        while (std::getline(existing, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+    }
+    lines.push_back(json.str());
+    const std::size_t first = lines.size() > keep ? lines.size() - keep : 0;
+
+    std::string content;
+    for (std::size_t i = first; i < lines.size(); ++i) {
+        content += lines[i];
+        content += '\n';
+    }
+    std::string error;
+    return write_file_atomically(path, content, error);
+}
 
 std::string targets_json(const Session& session) {
     const auto& config = session.config;

@@ -242,6 +242,102 @@ if(NOT (code EQUAL 0 AND out MATCHES "Hello from demo"))
     fail("scaffolded project builds and runs")
 endif()
 
+# --- --timings and .luma/timings.jsonl ---------------------------------------
+file(APPEND "${hello}/src/main.cpp" "// timings test\n")
+run_luma("${hello}" out code build --timings)
+if(NOT (code EQUAL 0))
+    fail("build --timings succeeds")
+endif()
+if(NOT (out MATCHES "luma: build succeeded [^\n]*\nluma: timings {[^\n]*}\n$"))
+    fail("timings line follows the status line")
+endif()
+string(REGEX REPLACE ".*\nluma: timings ([^\n]*)\n$" "\\1" timings "${out}")
+string(JSON task_count ERROR_VARIABLE json_error LENGTH "${timings}" tasks)
+if(NOT (task_count EQUAL 2))
+    fail("timings list the 2 tasks that ran (${json_error})")
+endif()
+string(JSON total ERROR_VARIABLE json_error GET "${timings}" total_ms)
+string(JSON verb ERROR_VARIABLE json_error GET "${timings}" tasks 0 verb)
+string(JSON ms0 ERROR_VARIABLE json_error GET "${timings}" tasks 0 ms)
+string(JSON ms1 ERROR_VARIABLE json_error GET "${timings}" tasks 1 ms)
+string(JSON toutput ERROR_VARIABLE json_error GET "${timings}" tasks 0 output)
+if(NOT (total GREATER_EQUAL 0 AND ms0 GREATER_EQUAL ms1 AND IS_ABSOLUTE "${toutput}" AND verb MATCHES "^(compile|link)$"))
+    fail("timings fields and ordering (${timings})")
+endif()
+
+run_luma("${hello}" out code build)
+if(out MATCHES "luma: timings")
+    fail("no timings line without --timings")
+endif()
+
+file(STRINGS "${hello}/.luma/timings.jsonl" history)
+list(LENGTH history history_length)
+list(GET history -1 last_record)
+string(JSON last_status ERROR_VARIABLE json_error GET "${last_record}" status)
+string(JSON last_profile ERROR_VARIABLE json_error GET "${last_record}" profile)
+string(JSON last_stamp ERROR_VARIABLE json_error GET "${last_record}" timestamp)
+if(NOT (history_length GREATER_EQUAL 5 AND last_status STREQUAL "succeeded" AND last_profile STREQUAL "debug" AND last_stamp GREATER 1600000000))
+    fail("timings.jsonl records builds (${history_length}: ${last_record})")
+endif()
+foreach(i RANGE 1 50)
+    file(APPEND "${hello}/.luma/timings.jsonl" "${last_record}\n")
+endforeach()
+run_luma("${hello}" out code build)
+file(STRINGS "${hello}/.luma/timings.jsonl" history)
+list(LENGTH history history_length)
+if(NOT (history_length EQUAL 50))
+    fail("timings.jsonl keeps the last 50 builds (has ${history_length})")
+endif()
+
+# --- killing a build mid-way must not break the next incremental build --------
+# The generator writes a broken header first and the real one after a delay,
+# like a compiler that is interrupted while writing its output.
+set(killed "${WORK_DIR}/killed")
+file(MAKE_DIRECTORY "${killed}/src")
+file(WRITE "${killed}/slowgen.cmake" [=[
+file(WRITE "${OUT}" "#error partial output from an interrupted generator\n")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 3)
+file(READ "${IN}" value)
+string(STRIP "${value}" value)
+file(WRITE "${OUT}" "#define VALUE ${value}\n")
+]=])
+file(WRITE "${killed}/luma.lua" "
+project('killed')
+generate('slow', {
+    inputs = { 'input.txt' },
+    outputs = { 'build/gen/value.hpp' },
+    command = { [[${CMAKE_COMMAND}]], '-DOUT=$output', '-DIN=$root/input.txt', '-P', '$root/slowgen.cmake' },
+})
+target('app', { kind = 'executable', sources = glob('src/*.cpp'), include_dirs = { 'build/gen' } })
+")
+file(WRITE "${killed}/src/main.cpp" "#include \"value.hpp\"\n#include <cstdio>\nint main() { std::printf(\"value %d\\n\", VALUE); return 0; }\n")
+file(WRITE "${killed}/input.txt" "1\n")
+run_luma("${killed}" out code run app)
+if(NOT (code EQUAL 0 AND out MATCHES "value 1"))
+    fail("generator project builds")
+endif()
+
+file(WRITE "${killed}/input.txt" "2\n")
+execute_process(
+    COMMAND "${LUMA}" build
+    WORKING_DIRECTORY "${killed}"
+    OUTPUT_VARIABLE out
+    ERROR_VARIABLE err
+    RESULT_VARIABLE code
+    TIMEOUT 1.5)
+message(STATUS "killed build -> ${code}\n${out}${err}")
+if(code EQUAL 0)
+    fail("the build was expected to be killed by the timeout")
+endif()
+# Restore the input the cache last saw: only the journal tells luma that the
+# generator's output is now half-written.
+file(WRITE "${killed}/input.txt" "1\n")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 2) # let a stray child finish
+run_luma("${killed}" out code run app)
+if(NOT (code EQUAL 0 AND out MATCHES "value 1"))
+    fail("build after a killed build recovers")
+endif()
+
 if(failures GREATER 0)
     message(FATAL_ERROR "${failures} check(s) failed")
 endif()

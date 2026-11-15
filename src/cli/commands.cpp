@@ -8,6 +8,7 @@
 #include "luma/filesystem/path_util.hpp"
 
 #include <cctype>
+#include <cstdint>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -28,8 +29,8 @@ namespace {
 void print_usage(std::ostream& out) {
     out << "Luma - a build graph engine with Lua configuration\n\n"
         << "Usage:\n"
-        << "  luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb]\n"
-        << "  luma run <target> [--profile P] [-j N] [--no-compdb] [-- args...]\n"
+        << "  luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb] [--timings]\n"
+        << "  luma run <target> [--profile P] [-j N] [--no-compdb] [--timings] [-- args...]\n"
         << "  luma targets [--format table|json] [--profile P]\n"
         << "  luma compdb [--profile P] [--output PATH]\n"
         << "  luma init [name]\n"
@@ -51,6 +52,7 @@ struct ParsedArgs {
     bool dry_run = false;
     bool verbose = false;
     bool no_compdb = false;
+    bool timings = false;
     std::size_t jobs = 0;
     std::string error;
 };
@@ -120,6 +122,8 @@ ParsedArgs parse_args(int argc, char** argv) {
             args.verbose = true;
         } else if (arg == "--no-compdb") {
             args.no_compdb = true;
+        } else if (arg == "--timings") {
+            args.timings = true;
         } else if (arg.starts_with("-") && arg.size() > 1) {
             args.error = "unknown option: " + std::string(arg);
         } else {
@@ -190,20 +194,49 @@ int build_session(Session& session, const ParsedArgs& args,
         .jobs = args.jobs,
     };
     const auto result = executor::execute(session.config, session.plan, cache, options);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const std::int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 
-    if (result.exit_code != 0) {
-        std::cout << "luma: build failed" << std::endl;
-        return result.exit_code;
-    }
     if (args.dry_run) {
+        if (result.exit_code != 0) {
+            std::cout << "luma: build failed" << std::endl;
+            return result.exit_code;
+        }
         std::cout << "luma: dry run (" << result.tasks_run << " would run, " << result.tasks_skipped
                   << " up to date)" << std::endl;
         return 0;
     }
-    std::cout << "luma: build succeeded (" << result.tasks_run << " run, " << result.tasks_skipped
-              << " up to date) in " << format_seconds(std::chrono::steady_clock::now() - start)
-              << std::endl;
-    return 0;
+
+    const std::string status = result.cancelled ? "cancelled" : (result.exit_code != 0 ? "failed" : "succeeded");
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    append_timings_log(
+        fs::join(session.config.root, ".luma/timings.jsonl"),
+        now, session.config.profile, status, total_ms, result.timings);
+
+    if (result.cancelled) {
+        std::cerr << "luma: build cancelled\n";
+    }
+    if (result.exit_code != 0) {
+        std::cout << "luma: build failed" << std::endl;
+    } else {
+        std::cout << "luma: build succeeded (" << result.tasks_run << " run, " << result.tasks_skipped
+                  << " up to date) in " << format_seconds(elapsed) << std::endl;
+    }
+    if (args.timings) {
+        std::cout << "luma: timings " << timings_json(total_ms, result.timings) << std::endl;
+    }
+    return result.exit_code;
+}
+
+/// For builds that fail before any task runs (configuration errors).
+void print_failed_build(const ParsedArgs& args, std::chrono::steady_clock::time_point start) {
+    std::cout << "luma: build failed" << std::endl;
+    if (args.timings) {
+        const std::int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        std::cout << "luma: timings " << timings_json(total_ms, {}) << std::endl;
+    }
 }
 
 int cmd_build(const ParsedArgs& args) {
@@ -214,7 +247,7 @@ int cmd_build(const ParsedArgs& args) {
     Session session;
     if (const auto err = load_session(session, args, args.positionals)) {
         fail(err->message);
-        std::cout << "luma: build failed" << std::endl;
+        print_failed_build(args, start);
         return 1;
     }
     return build_session(session, args, start);
@@ -237,7 +270,7 @@ int cmd_run(const ParsedArgs& args) {
     Session session;
     if (const auto err = load_session(session, args, {target_name})) {
         fail(err->message);
-        std::cout << "luma: build failed" << std::endl;
+        print_failed_build(args, start);
         return 1;
     }
 

@@ -3,6 +3,7 @@
 #include "luma/filesystem/path_util.hpp"
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -23,6 +24,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #endif
 
 namespace luma::executor {
@@ -38,6 +42,9 @@ std::mutex& spawn_mutex() {
     static std::mutex mutex;
     return mutex;
 }
+
+std::atomic<bool> g_cancelled{false};
+std::atomic<int> g_cancel_signal{0};
 
 #ifdef _WIN32
 /// Quote one argument following the MSVC runtime's CommandLineToArgvW rules.
@@ -111,12 +118,90 @@ std::string drain_handle(HANDLE pipe) {
     return text;
 }
 
+/// Job object holding every child: closing its last handle (which happens
+/// when luma exits for any reason, including TerminateProcess) kills them.
+HANDLE child_job() {
+    static HANDLE job = []() -> HANDLE {
+        HANDLE handle = CreateJobObjectA(nullptr, nullptr);
+        if (!handle) {
+            return nullptr;
+        }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(handle, JobObjectExtendedLimitInformation, &info, sizeof(info))) {
+            CloseHandle(handle);
+            return nullptr;
+        }
+        return handle;
+    }();
+    return job;
+}
+
+/// Start a process created with CREATE_SUSPENDED inside the job.
+void adopt_and_resume(const PROCESS_INFORMATION& pi) {
+    if (HANDLE job = child_job()) {
+        AssignProcessToJobObject(job, pi.hProcess);
+    }
+    if (g_cancelled.load()) {
+        TerminateProcess(pi.hProcess, 1); // cancelled while spawning
+    }
+    ResumeThread(pi.hThread);
+}
+
+BOOL WINAPI cancel_console_ctrl(DWORD) {
+    if (g_cancelled.exchange(true)) {
+        return FALSE; // second request: default handling terminates luma
+    }
+    g_cancel_signal = 2;
+    if (HANDLE job = child_job()) {
+        TerminateJobObject(job, 1);
+    }
+    return TRUE;
+}
+
 BOOL WINAPI ignore_console_ctrl(DWORD) {
     // The child shares our console and receives Ctrl+C itself; we keep
     // running so that we can forward its exit code.
     return TRUE;
 }
 #else
+constexpr std::size_t kMaxTrackedChildren = 1024;
+std::array<std::atomic<pid_t>, kMaxTrackedChildren> g_children{};
+
+void track_child(pid_t pid) {
+    for (auto& slot : g_children) {
+        pid_t expected = 0;
+        if (slot.compare_exchange_strong(expected, pid)) {
+            return;
+        }
+    }
+}
+
+void untrack_child(pid_t pid) {
+    for (auto& slot : g_children) {
+        pid_t expected = pid;
+        if (slot.compare_exchange_strong(expected, 0)) {
+            return;
+        }
+    }
+}
+
+extern "C" void on_cancel_signal(int signal_number) {
+    // Async-signal-safe: atomics and kill() only. SA_RESETHAND restores the
+    // default disposition, so a second signal terminates luma.
+    g_cancel_signal = signal_number;
+    g_cancelled = true;
+    for (auto& slot : g_children) {
+        const pid_t pid = slot.load();
+        if (pid > 0) {
+            kill(-pid, SIGTERM); // the child's whole process group
+        }
+    }
+}
+
+constexpr std::array<int, 3> kCancelSignals = {SIGINT, SIGTERM, SIGHUP};
+std::array<struct sigaction, 3> g_previous_handlers{};
+
 std::string drain_fd(int fd) {
     std::string text;
     std::array<char, 4096> buffer{};
@@ -216,6 +301,10 @@ ProcessResult run_process(
         result.stderr_text = "empty command";
         return result;
     }
+    if (g_cancelled.load()) {
+        result.stderr_text = "cancelled";
+        return result;
+    }
 
 #ifdef _WIN32
     SECURITY_ATTRIBUTES sa{};
@@ -269,13 +358,15 @@ ProcessResult run_process(
             nullptr,
             nullptr,
             TRUE,
-            CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED,
             nullptr,
             cwd.empty() ? nullptr : cwd.c_str(),
             &si,
             &pi);
         if (!created) {
             spawn_error = last_error_message();
+        } else {
+            adopt_and_resume(pi);
         }
 
         // Close our copies of the write ends while still holding the lock so
@@ -338,8 +429,22 @@ ProcessResult run_process(
             return result;
         }
 
+        const pid_t parent_pid = getpid();
         pid = fork();
         if (pid == 0) {
+            // Own process group, so cancellation can stop the whole tree
+            // (compiler drivers spawn cc1/as/ld; shells spawn commands).
+            setpgid(0, 0);
+#ifdef __linux__
+            // If luma is killed outright (SIGKILL), do not leave the task
+            // running and writing outputs behind the next build's back.
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (getppid() != parent_pid) {
+                _exit(127);
+            }
+#else
+            (void)parent_pid;
+#endif
             const int null_fd = open("/dev/null", O_RDONLY);
             if (null_fd >= 0) {
                 dup2(null_fd, STDIN_FILENO);
@@ -352,6 +457,13 @@ ProcessResult run_process(
         close(stdout_pipe[1]);
         if (!merge_output) {
             close(stderr_pipe[1]);
+        }
+        if (pid > 0) {
+            setpgid(pid, pid); // also from the parent: no race with the child
+            track_child(pid);
+            if (g_cancelled.load()) {
+                kill(-pid, SIGTERM); // cancelled between the check and fork
+            }
         }
     }
 
@@ -378,6 +490,7 @@ ProcessResult run_process(
     }
 
     result.exit_code = wait_for(pid);
+    untrack_child(pid);
 #endif
 
     return result;
@@ -420,13 +533,15 @@ int run_process_interactive(
             nullptr,
             nullptr,
             TRUE,
-            0,
+            CREATE_SUSPENDED,
             nullptr,
             cwd.empty() ? nullptr : cwd.c_str(),
             &si,
             &pi);
         if (!created) {
             spawn_error = last_error_message();
+        } else {
+            adopt_and_resume(pi);
         }
     }
 
@@ -476,6 +591,40 @@ int run_process_interactive(
     sigaction(SIGQUIT, &old_quit, nullptr);
     return exit_code;
 #endif
+}
+
+CancellationScope::CancellationScope() {
+#ifdef _WIN32
+    child_job();
+    SetConsoleCtrlHandler(cancel_console_ctrl, TRUE);
+#else
+    struct sigaction action {};
+    action.sa_handler = on_cancel_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESETHAND;
+    for (std::size_t i = 0; i < kCancelSignals.size(); ++i) {
+        sigaction(kCancelSignals[i], &action, &g_previous_handlers[i]);
+    }
+#endif
+}
+
+CancellationScope::~CancellationScope() {
+#ifdef _WIN32
+    SetConsoleCtrlHandler(cancel_console_ctrl, FALSE);
+#else
+    for (std::size_t i = 0; i < kCancelSignals.size(); ++i) {
+        sigaction(kCancelSignals[i], &g_previous_handlers[i], nullptr);
+    }
+#endif
+}
+
+bool cancellation_requested() {
+    return g_cancelled.load();
+}
+
+int cancellation_exit_code() {
+    const int signal_number = g_cancel_signal.load();
+    return 128 + (signal_number > 0 ? signal_number : 2);
 }
 
 } // namespace luma::executor
