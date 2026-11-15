@@ -72,6 +72,7 @@ Both `target "x" { ... }` and `target("x", { ... })` work.
 | --- | --- |
 | `luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb] [--timings]` | Build all targets, or the named targets and their dependencies. |
 | `luma run <target> [--profile P] [-j N] [--no-compdb] [--timings] [-- args...]` | Build the target, then run its executable. |
+| `luma test [target...] [--profile P] [-j N] [--timeout S] [--format text\|json] [-- args...]` | Build and run the test targets (`test = true`, or the named ones). |
 | `luma targets [--format table\|json] [--profile P]` | Describe the project and its targets. |
 | `luma compdb [--profile P] [--output PATH]` | Write a clang `compile_commands.json`. |
 | `luma init [name]` | Create a new project in the current directory. |
@@ -238,6 +239,38 @@ stdin/stdout/stderr. Luma exits with the program's exit code (on POSIX,
 `128 + N` if it was killed by signal N). If the build fails, the program is
 not run and the exit code is 1. The target must be an executable.
 
+### `luma test`
+
+Mark test executables with `test = true`:
+
+```lua
+target "math_test" {
+    sources = { "tests/math_test.cpp" },
+    dependencies = { "math" },
+    test = true,
+}
+```
+
+`luma test` builds the test targets (and only what they need), runs them in
+parallel from the project root (`-j N`), and prints one line per test.
+A test passes when it exits with 0. The output of failing tests is printed
+unchanged, so `file:line` references in it stay clickable in editors:
+
+```text
+[1/3] FAIL bad_test (0.01s, exit code 1)
+tests/bad_test.cpp:3: expected 4, got 5
+[2/3] PASS math_test (0.01s)
+[3/3] FAIL hang_test (300.00s, timed out)
+luma: tests: 1 passed, 2 failed in 300.01s (bad_test, hang_test)
+```
+
+`--timeout S` kills a test after S seconds (default 300, 0 = no limit).
+`--verbose` also prints the output of passing tests. Arguments after `--` go
+to every test. `--format json` prints one `luma: test {...}` line per test
+(`name`, `status` = passed/failed/timeout/error, `exit_code`, `ms`, `output`)
+and a final `luma: tests {"passed":N,"failed":M,"ms":T}`. The exit code is
+1 when any test failed.
+
 ### `luma targets`
 
 Without `--format json`, prints a human-readable summary and table.
@@ -260,7 +293,8 @@ With `--format json`, prints a single JSON object (one line) to stdout:
       "sources": ["/abs/root/src/main.cpp"],
       "include_dirs": ["/abs/root/include"],
       "defines": ["DEBUG"],
-      "dependencies": ["core"]
+      "dependencies": ["core"],
+      "test": false
     }
   ]
 }
@@ -282,6 +316,7 @@ With `--format json`, prints a single JSON object (one line) to stdout:
 | `include_dirs` | Effective include directories: the target's own (`include_dirs`, `public_include_dirs`), then those of its (transitive) dependencies. |
 | `defines` | Effective defines, exactly as passed to the compiler: profile, target `defines`, target `public_defines`, then the `public_defines` of its transitive dependencies in dependency order; duplicates removed. |
 | `dependencies` | Direct dependencies as declared. |
+| `test` | `true` for targets that `luma test` runs. |
 
 All paths are absolute and use forward slashes. Strings use standard JSON
 escaping (invalid UTF-8 is replaced with U+FFFD).

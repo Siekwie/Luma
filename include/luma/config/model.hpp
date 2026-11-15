@@ -65,6 +65,8 @@ struct TargetDef {
     std::vector<Path> public_include_dirs;
     std::vector<std::string> public_cflags;
     std::vector<std::string> public_cxxflags;
+    /// An executable that `luma test` runs (exit code 0 = pass).
+    bool test = false;
 };
 
 struct ProjectConfig {

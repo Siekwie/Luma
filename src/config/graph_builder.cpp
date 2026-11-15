@@ -551,6 +551,9 @@ std::optional<BuildPlanError> build_plan(
         if (sources.empty()) {
             return BuildPlanError{"target '" + target.name + "' has no sources"};
         }
+        if (target.test && target.kind != TargetKind::Executable) {
+            return BuildPlanError{"target '" + target.name + "' has test = true but is not an executable"};
+        }
 
         // Include directories: own (include_dirs and public_include_dirs),
         // then each dependency's. Both kinds are exported to dependents.
@@ -697,6 +700,7 @@ std::optional<BuildPlanError> build_plan(
             .include_dirs = include_dirs,
             .defines = defines,
             .dependencies = target.dependencies,
+            .test = target.test,
         });
     }
 

@@ -4,6 +4,8 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -322,10 +324,53 @@ std::string format_command(const std::vector<std::string>& command) {
     return out;
 }
 
+namespace {
+
+/// Kills a child that outlives its timeout. `kill` runs on the watchdog thread.
+class Watchdog {
+public:
+    template <typename Kill>
+    Watchdog(double seconds, bool& timed_out, Kill kill) {
+        if (seconds <= 0) {
+            return;
+        }
+        thread_ = std::thread([this, seconds, &timed_out, kill]() {
+            std::unique_lock lock(mutex_);
+            const auto limit = std::chrono::duration<double>(seconds);
+            if (!cv_.wait_for(lock, limit, [this]() { return done_; })) {
+                timed_out = true;
+                kill();
+            }
+        });
+    }
+    /// Call once the child's output is drained, before reaping it (so the
+    /// watchdog never signals a reaped, possibly reused, pid).
+    void disarm() {
+        {
+            std::lock_guard lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+    ~Watchdog() { disarm(); }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool done_ = false;
+    std::thread thread_;
+};
+
+} // namespace
+
 ProcessResult run_process(
     const std::vector<std::string>& command,
     const std::string& working_directory,
-    bool merge_output) {
+    bool merge_output,
+    double timeout_seconds) {
     ProcessResult result;
     if (command.empty()) {
         result.stderr_text = "empty command";
@@ -419,6 +464,8 @@ ProcessResult run_process(
 
     // Drain the pipes before waiting: a child that fills a pipe buffer would
     // otherwise block forever.
+    const HANDLE child_process = pi.hProcess;
+    Watchdog watchdog(timeout_seconds, result.timed_out, [child_process]() { TerminateProcess(child_process, 1); });
     std::thread stderr_thread;
     if (stderr_read) {
         stderr_thread = std::thread([&]() { result.stderr_text = drain_handle(stderr_read); });
@@ -427,6 +474,7 @@ ProcessResult run_process(
     if (stderr_thread.joinable()) {
         stderr_thread.join();
     }
+    watchdog.disarm();
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD exit_code = 1;
@@ -504,6 +552,7 @@ ProcessResult run_process(
         return result;
     }
 
+    Watchdog watchdog(timeout_seconds, result.timed_out, [pid]() { kill(-pid, SIGKILL); });
     std::thread stderr_thread;
     if (!merge_output) {
         stderr_thread = std::thread([&]() { result.stderr_text = drain_fd(stderr_pipe[0]); });
@@ -512,6 +561,7 @@ ProcessResult run_process(
     if (stderr_thread.joinable()) {
         stderr_thread.join();
     }
+    watchdog.disarm();
     close(stdout_pipe[0]);
     if (!merge_output) {
         close(stderr_pipe[0]);

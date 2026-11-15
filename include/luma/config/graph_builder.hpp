@@ -26,6 +26,8 @@ struct TargetInfo {
     std::vector<std::string> defines;
     /// Direct dependencies as declared.
     std::vector<std::string> dependencies;
+    /// Run by `luma test`.
+    bool test = false;
 };
 
 struct BuildPlan {

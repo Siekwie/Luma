@@ -7,14 +7,22 @@
 #include "luma/executor/process.hpp"
 #include "luma/filesystem/path_util.hpp"
 
+#include "luma/util/json.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #ifndef LUMA_VERSION
 #define LUMA_VERSION "0.0.0"
@@ -31,6 +39,7 @@ void print_usage(std::ostream& out) {
         << "Usage:\n"
         << "  luma build [target...] [--profile P] [-j N] [--dry-run] [--verbose] [--no-compdb] [--timings]\n"
         << "  luma run <target> [--profile P] [-j N] [--no-compdb] [--timings] [-- args...]\n"
+        << "  luma test [target...] [--profile P] [-j N] [--timeout S] [--format text|json] [--verbose] [-- args...]\n"
         << "  luma targets [--format table|json] [--profile P]\n"
         << "  luma compdb [--profile P] [--output PATH]\n"
         << "  luma init [name]\n"
@@ -47,6 +56,7 @@ struct ParsedArgs {
     std::string profile;
     std::string format;
     std::string output;
+    std::string timeout;
     std::vector<std::string> positionals;
     std::vector<std::string> passthrough;
     bool dry_run = false;
@@ -110,7 +120,8 @@ ParsedArgs parse_args(int argc, char** argv) {
             break;
         }
         if (take_value("--profile", args.profile) || take_value("--format", args.format) ||
-            take_value("--output", args.output) || take_value("-o", args.output)) {
+            take_value("--output", args.output) || take_value("-o", args.output) ||
+            take_value("--timeout", args.timeout)) {
         } else if (take_value("--jobs", jobs_text) || take_value("-j", jobs_text) ||
                    (arg.starts_with("-j") && arg.size() > 2 && (jobs_text = arg.substr(2), true))) {
             if (args.error.empty() && !parse_jobs(jobs_text, args.jobs)) {
@@ -293,6 +304,178 @@ int cmd_run(const ParsedArgs& args) {
     std::cout.flush();
     std::cerr.flush();
     return executor::run_process_interactive(command);
+}
+
+/// `luma test`: build the test targets (test = true, or the named ones), run
+/// them from the project root, report pass/fail. Output of failing tests is
+/// printed unchanged so file:line references stay usable.
+int cmd_test(const ParsedArgs& args) {
+    const auto start = std::chrono::steady_clock::now();
+    const std::string format = args.format.empty() ? "text" : args.format;
+    if (format != "text" && format != "json") {
+        return fail("unknown format '" + format + "' (expected text or json)");
+    }
+    if (args.dry_run) {
+        return fail("'luma test' does not support --dry-run");
+    }
+    double timeout = 300;
+    if (!args.timeout.empty()) {
+        char* end = nullptr;
+        timeout = std::strtod(args.timeout.c_str(), &end);
+        if (end == args.timeout.c_str() || *end != '\0' || timeout < 0) {
+            return fail("invalid --timeout: " + args.timeout + " (seconds, 0 = none)");
+        }
+    }
+
+    // Load everything once to find the test targets, then plan just those.
+    std::vector<std::string> names = args.positionals;
+    if (names.empty()) {
+        Session all;
+        if (const auto err = load_session(all, args)) {
+            return fail(err->message);
+        }
+        for (const auto& t : all.plan.targets) {
+            if (t.test) {
+                names.push_back(t.name);
+            }
+        }
+        if (names.empty()) {
+            std::cout << "luma: no test targets (mark executables with test = true in luma.lua)" << std::endl;
+            return 0;
+        }
+    }
+    Session session;
+    if (const auto err = load_session(session, args, names)) {
+        fail(err->message);
+        print_failed_build(args, start);
+        return 1;
+    }
+    std::vector<const config::TargetInfo*> tests;
+    for (const auto& name : names) {
+        const config::TargetInfo* found = nullptr;
+        for (const auto& t : session.plan.targets) {
+            if (t.name == name) {
+                found = &t;
+            }
+        }
+        if (!found || found->kind != config::TargetKind::Executable) {
+            return fail("target '" + name + "' is not an executable");
+        }
+        tests.push_back(found);
+    }
+    if (const int code = build_session(session, args, start); code != 0) {
+        return code;
+    }
+
+    struct Result {
+        std::string name, status, output;
+        int exit_code = 0;
+        std::int64_t ms = 0;
+    };
+    const std::size_t jobs = args.jobs ? args.jobs : std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    std::atomic<std::size_t> next{0};
+    std::mutex print_mutex;
+    std::size_t finished = 0, passed = 0;
+    std::vector<std::string> failed_names;
+    const auto tests_start = std::chrono::steady_clock::now();
+    auto report = [&](const Result& r) {
+        std::lock_guard lock(print_mutex);
+        ++finished;
+        if (r.status == "passed") {
+            ++passed;
+        } else {
+            failed_names.push_back(r.name);
+        }
+        if (format == "json") {
+            util::JsonWriter json;
+            json.begin_object();
+            json.field("name", r.name);
+            json.field("status", r.status);
+            json.key("exit_code").value(static_cast<std::int64_t>(r.exit_code));
+            json.key("ms").value(r.ms);
+            json.field("output", r.output);
+            json.end_object();
+            std::cout << "luma: test " << json.str() << std::endl;
+            return;
+        }
+        char line[64];
+        std::snprintf(line, sizeof(line), "[%zu/%zu] ", finished, tests.size());
+        char secs[32];
+        std::snprintf(secs, sizeof(secs), "%.2fs", static_cast<double>(r.ms) / 1000.0);
+        std::cout << line << (r.status == "passed" ? "PASS " : "FAIL ") << r.name << " (" << secs;
+        if (r.status == "timeout") {
+            std::cout << ", timed out";
+        } else if (r.status != "passed") {
+            std::cout << ", exit code " << r.exit_code;
+        }
+        std::cout << ")\n";
+        if (r.status != "passed" || args.verbose) {
+            std::cout << r.output;
+            if (!r.output.empty() && r.output.back() != '\n') {
+                std::cout << '\n';
+            }
+        }
+        std::cout.flush();
+    };
+    auto worker = [&]() {
+        for (;;) {
+            const std::size_t i = next.fetch_add(1);
+            if (i >= tests.size() || executor::cancellation_requested()) {
+                return;
+            }
+            const auto* t = tests[i];
+            std::vector<std::string> command = {fs::to_native(fs::join(session.config.root, t->output))};
+            command.insert(command.end(), args.passthrough.begin(), args.passthrough.end());
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto pr = executor::run_process(command, session.config.root, true, timeout);
+            Result r;
+            r.name = t->name;
+            r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            r.exit_code = pr.exit_code;
+            r.output = pr.stdout_text + pr.stderr_text;
+            r.status = pr.timed_out ? "timeout" : pr.exit_code == 0 ? "passed" : pr.exit_code < 0 ? "error" : "failed";
+            report(r);
+        }
+    };
+    {
+        executor::CancellationScope cancel_scope;
+        std::vector<std::thread> pool;
+        for (std::size_t k = 0; k < std::min(jobs, tests.size()); ++k) {
+            pool.emplace_back(worker);
+        }
+        for (auto& th : pool) {
+            th.join();
+        }
+    }
+    const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tests_start).count();
+    const std::size_t failed = failed_names.size();
+    if (format == "json") {
+        util::JsonWriter json;
+        json.begin_object();
+        json.key("passed").value(static_cast<std::int64_t>(passed));
+        json.key("failed").value(static_cast<std::int64_t>(failed));
+        json.key("ms").value(ms);
+        json.end_object();
+        std::cout << "luma: tests " << json.str() << std::endl;
+    } else {
+        char secs[32];
+        std::snprintf(secs, sizeof(secs), "%.2fs", ms / 1000.0);
+        std::cout << "luma: tests: " << passed << " passed, " << failed << " failed in " << secs;
+        if (failed) {
+            std::sort(failed_names.begin(), failed_names.end());
+            std::cout << " (";
+            for (std::size_t i = 0; i < failed_names.size(); ++i) {
+                std::cout << (i ? ", " : "") << failed_names[i];
+            }
+            std::cout << ")";
+        }
+        std::cout << std::endl;
+    }
+    if (executor::cancellation_requested()) {
+        return executor::cancellation_exit_code();
+    }
+    return failed ? 1 : 0;
 }
 
 int cmd_targets(const ParsedArgs& args) {
@@ -525,6 +708,9 @@ CommandResult run(int argc, char** argv) {
     }
     if (args.command == "run") {
         return {cmd_run(args)};
+    }
+    if (args.command == "test") {
+        return {cmd_test(args)};
     }
     if (args.command == "targets") {
         return {cmd_targets(args)};

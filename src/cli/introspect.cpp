@@ -180,6 +180,7 @@ std::string targets_json(const Session& session) {
         json.key("include_dirs").string_array(absolute_paths(root, target.include_dirs));
         json.key("defines").string_array(target.defines);
         json.key("dependencies").string_array(target.dependencies);
+        json.field("test", target.test);
         json.end_object();
     }
     json.end_array();

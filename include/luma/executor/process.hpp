@@ -11,16 +11,21 @@ struct ProcessResult {
     std::string stdout_text;
     /// Empty when the output was merged into stdout_text.
     std::string stderr_text;
+    /// The child ran longer than the timeout and was killed.
+    bool timed_out = false;
 };
 
 /// Run a command (argv-style, PATH lookup) and capture its output.
 /// With `merge_output`, stderr is redirected into the same pipe as stdout so
 /// diagnostics keep their original interleaving. The child's stdin is the
-/// null device. Safe to call from several threads at once.
+/// null device. Safe to call from several threads at once. With
+/// `timeout_seconds` > 0 a child still running after that long is killed
+/// (its process group on POSIX) and `timed_out` is set.
 ProcessResult run_process(
     const std::vector<std::string>& command,
     const std::string& working_directory = {},
-    bool merge_output = false);
+    bool merge_output = false,
+    double timeout_seconds = 0);
 
 /// Run a command that inherits this process's stdin/stdout/stderr and wait
 /// for it. Returns the child's exit code (128 + signal number when it was

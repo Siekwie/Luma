@@ -355,6 +355,40 @@ if(NOT (code EQUAL 0 AND out MATCHES "value 1"))
     fail("build after a killed build recovers")
 endif()
 
+# --- luma test: builds and runs test = true targets, reports, times out
+set(tproj "${WORK_DIR}/tproj")
+file(MAKE_DIRECTORY "${tproj}/tests")
+file(WRITE "${tproj}/luma.lua" [=[
+project "tproj"
+target "lib" { kind = "static_library", sources = { "lib.cpp" } }
+target "good_test" { sources = { "tests/good.cpp" }, dependencies = { "lib" }, test = true }
+target "bad_test" { sources = { "tests/bad.cpp" }, test = true }
+target "slow_test" { sources = { "tests/slow.cpp" }, test = true }
+target "app" { sources = { "main.cpp" } }
+]=])
+file(WRITE "${tproj}/lib.cpp" "int add(int a, int b) { return a + b; }\n")
+file(WRITE "${tproj}/main.cpp" "int main() { return 0; }\n")
+file(WRITE "${tproj}/tests/good.cpp" "int add(int, int);\nint main() { return add(2, 2) == 4 ? 0 : 1; }\n")
+file(WRITE "${tproj}/tests/bad.cpp" "#include <cstdio>\nint main() { std::printf(\"tests/bad.cpp:2: boom\\n\"); return 3; }\n")
+file(WRITE "${tproj}/tests/slow.cpp" "#include <chrono>\n#include <thread>\nint main() { std::this_thread::sleep_for(std::chrono::seconds(20)); }\n")
+run_luma("${tproj}" out code test --timeout 1)
+if(NOT (code EQUAL 1 AND out MATCHES "PASS good_test" AND out MATCHES "FAIL bad_test \\([0-9.]+s, exit code 3\\)\ntests/bad.cpp:2: boom"
+        AND out MATCHES "FAIL slow_test \\([0-9.]+s, timed out\\)" AND out MATCHES "luma: tests: 1 passed, 2 failed"))
+    fail("luma test runs test targets and reports failures and timeouts")
+endif()
+if(EXISTS "${tproj}/build/app" OR EXISTS "${tproj}/build/app.exe")
+    fail("luma test builds only the test targets")
+endif()
+run_luma("${tproj}" out code test good_test --format json)
+if(NOT (code EQUAL 0 AND out MATCHES "luma: test {\"name\":\"good_test\",\"status\":\"passed\",\"exit_code\":0," AND out MATCHES "luma: tests {\"passed\":1,\"failed\":0,"))
+    fail("luma test --format json")
+endif()
+run_luma("${tproj}" json code targets --format json)
+string(JSON t0 ERROR_VARIABLE json_error GET "${json}" targets 0 test)
+if(NOT (t0 STREQUAL "OFF" OR t0 STREQUAL "false"))
+    fail("targets json reports test = false for app (got ${t0})")
+endif()
+
 # --- profiles: inherit = "<profile>" (chains), unknown parent and cycles are errors
 set(prof "${WORK_DIR}/prof")
 file(MAKE_DIRECTORY "${prof}/src")

@@ -296,6 +296,7 @@ int api_target(lua_State* L) {
     TargetDef target;
     target.name = name;
     target.kind = read_target_kind(L, 2);
+    target.test = read_bool_field(L, 2, "test", false);
     target.language = read_string_field(L, 2, "language");
     if (target.language.empty()) {
         target.language = "cxx";
