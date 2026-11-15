@@ -11,7 +11,10 @@ namespace luma::cache {
 
 struct TaskCacheEntry {
     Hash cache_key;
+    /// Declared inputs and their content hashes when the task last succeeded.
     std::unordered_map<Path, Hash> input_hashes;
+    /// Inputs discovered while running the task (e.g. included headers).
+    std::unordered_map<Path, Hash> discovered_hashes;
 };
 
 class CacheStore {

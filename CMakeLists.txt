@@ -22,6 +22,7 @@ set(LUMA_CORE_SOURCES
     src/cache/cache_store.cpp
     src/executor/process.cpp
     src/executor/executor.cpp
+    src/executor/depfile.cpp
     src/cli/session.cpp
 )
 
@@ -34,6 +35,9 @@ add_executable(luma
     src/cli/commands.cpp
 )
 target_link_libraries(luma PRIVATE luma_core)
+
+find_package(Threads REQUIRED)
+target_link_libraries(luma_core PUBLIC Threads::Threads)
 
 if(MSVC)
     target_compile_options(luma_core PRIVATE /W4 /utf-8)

@@ -5,44 +5,79 @@
 #include "luma/lua/config_loader.hpp"
 #include "luma/toolchain/toolchain.hpp"
 
+#include <algorithm>
 #include <iostream>
-#include <filesystem>
 
 namespace luma::cli {
 
 namespace fs = luma::fs;
-namespace stdfs = std::filesystem;
 
 std::optional<SessionError> Session::load(Session& out, const SessionOptions& options) {
     out.config = config::ProjectConfig{};
-    out.config.root = fs::normalize(options.project_root);
-    out.config.profile = options.profile.empty() ? "debug" : options.profile;
+    out.plan = config::BuildPlan{};
+    out.config.profile.clear();
 
     Path config_path = options.config_path;
     if (config_path.empty()) {
-        const auto found = fs::find_upwards(out.config.root, "luma.lua");
+        const Path start = fs::absolute(options.project_root.empty() ? Path{"."} : options.project_root);
+        const auto found = fs::find_upwards(start, "luma.lua");
         if (!found) {
-            return SessionError{"could not find luma.lua"};
+            return SessionError{"could not find luma.lua in " + start + " or any parent directory"};
         }
         config_path = *found;
     }
+    config_path = fs::absolute(config_path);
+    out.config.root = fs::parent(config_path);
 
     if (const auto err = lua_loader::load_config(config_path, out.config)) {
         return SessionError{err->message};
     }
+    // The root is the directory holding luma.lua, regardless of the working
+    // directory luma was started from.
+    out.config.root = fs::parent(config_path);
 
-    out.config.root = stdfs::path(config_path).parent_path().generic_string();
-    if (out.config.root.empty()) {
-        out.config.root = ".";
+    // Profile selection: --profile wins, then set_profile() from luma.lua,
+    // then "debug", then the first profile by name.
+    const std::string configured = out.config.profile;
+    const auto names = out.profile_names();
+    if (!options.profile.empty()) {
+        if (!config::find_profile(out.config, options.profile)) {
+            std::string available;
+            for (const auto& name : names) {
+                available += available.empty() ? name : ", " + name;
+            }
+            return SessionError{
+                "unknown profile '" + options.profile + "' (available: " + available + ")"};
+        }
+        out.config.profile = options.profile;
+    } else if (!configured.empty() && config::find_profile(out.config, configured)) {
+        out.config.profile = configured;
+    } else if (config::find_profile(out.config, "debug") || names.empty()) {
+        out.config.profile = "debug";
+    } else {
+        out.config.profile = names.front();
     }
 
-    out.cache_dir = fs::join(out.config.root, fs::join(".luma", "cache"));
+    out.cache_dir = fs::join(out.config.root, ".luma/cache");
 
     if (const auto err = config::build_plan(out.config, out.plan, options.targets)) {
         return SessionError{err->message};
     }
 
     return std::nullopt;
+}
+
+Path Session::build_dir() const {
+    return fs::join(config.root, config.build_dir);
+}
+
+std::vector<std::string> Session::profile_names() const {
+    std::vector<std::string> names;
+    for (const auto& [name, _] : config.profiles) {
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 void inspect_target(const config::ProjectConfig& config, const std::string& target_name) {
@@ -56,17 +91,8 @@ void inspect_target(const config::ProjectConfig& config, const std::string& targ
     const config::ToolchainDef* toolchain = config::find_toolchain(config);
 
     std::cout << "Target: " << target->name << '\n';
-    switch (target->kind) {
-    case config::TargetKind::Executable:
-        std::cout << "Type: executable\n";
-        break;
-    case config::TargetKind::StaticLibrary:
-        std::cout << "Type: static_library\n";
-        break;
-    case config::TargetKind::SharedLibrary:
-        std::cout << "Type: shared_library\n";
-        break;
-    }
+    std::cout << "Type: " << config::kind_name(target->kind) << '\n';
+    std::cout << "Language: " << config::canonical_language(target->language) << '\n';
 
     std::cout << "Sources: " << target->sources.size() + target->source_patterns.size() << " pattern(s)\n";
     std::cout << "Include directories: " << target->include_dirs.size() << '\n';
@@ -85,15 +111,23 @@ void inspect_target(const config::ProjectConfig& config, const std::string& targ
     }
 
     if (toolchain) {
-        std::cout << "Compiler: " << toolchain->cxx << '\n';
+        std::cout << "C++ compiler: " << toolchain->cxx << "\nC compiler: " << toolchain->cc << '\n';
     }
     if (profile) {
         std::cout << "Profile: " << profile->name << '\n';
-        std::cout << "Flags:";
+        std::cout << "C++ flags:";
         for (const auto& flag : profile->cxxflags) {
             std::cout << ' ' << flag;
         }
         for (const auto& flag : target->cxxflags) {
+            std::cout << ' ' << flag;
+        }
+        std::cout << '\n';
+        std::cout << "C flags:";
+        for (const auto& flag : profile->cflags) {
+            std::cout << ' ' << flag;
+        }
+        for (const auto& flag : target->cflags) {
             std::cout << ' ' << flag;
         }
         std::cout << '\n';

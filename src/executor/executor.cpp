@@ -1,23 +1,62 @@
 #include "luma/executor/executor.hpp"
 
+#include "luma/executor/depfile.hpp"
 #include "luma/executor/process.hpp"
 #include "luma/filesystem/hash.hpp"
 #include "luma/filesystem/path_util.hpp"
 #include "luma/graph/task.hpp"
 
-#include <atomic>
+#include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <mutex>
-#include <queue>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 
 namespace luma::executor {
 
 namespace fs = luma::fs;
+namespace meta = config::meta;
 
 namespace {
+
+std::string metadata_value(const graph::Task& task, const char* key) {
+    const auto it = task.metadata.find(key);
+    return it == task.metadata.end() ? std::string{} : it->second;
+}
+
+/// Memoizes content hashes of discovered dependencies (headers): many
+/// translation units include the same files.
+class HashMemo {
+public:
+    std::optional<Hash> hash(const Path& path) {
+        {
+            std::lock_guard lock(mutex_);
+            const auto it = hashes_.find(path);
+            if (it != hashes_.end()) {
+                return it->second;
+            }
+        }
+        auto value = fs::hash_file(path);
+        std::lock_guard lock(mutex_);
+        hashes_[path] = value;
+        return value;
+    }
+
+    void forget(const Path& path) {
+        std::lock_guard lock(mutex_);
+        hashes_.erase(path);
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<Path, std::optional<Hash>> hashes_;
+};
 
 struct TaskStatus {
     std::vector<std::string> reasons;
@@ -26,28 +65,17 @@ struct TaskStatus {
     std::unordered_map<Path, Hash> input_hashes;
 };
 
-Path resolve_input_path(const Path& root, const Path& input) {
-    if (fs::exists(input)) {
-        return input;
-    }
-    const Path joined = fs::join(root, input);
-    if (fs::exists(joined)) {
-        return joined;
-    }
-    return input;
-}
-
 TaskStatus evaluate_task(
     const graph::Task& task,
-    const cache::CacheStore& cache,
+    const cache::TaskCacheEntry* previous,
     const config::BuildPlan& plan,
-    const Path& root) {
+    const Path& root,
+    HashMemo& memo) {
     TaskStatus status;
 
     std::vector<Hash> input_hashes;
     for (const auto& input : task.inputs) {
-        const Path path = resolve_input_path(root, input);
-        if (const auto hash = fs::hash_file(path)) {
+        if (const auto hash = fs::hash_file(fs::join(root, input))) {
             status.input_hashes[input] = *hash;
             input_hashes.push_back(*hash);
         } else {
@@ -59,15 +87,14 @@ TaskStatus evaluate_task(
         task, input_hashes, plan.toolchain_identity, plan.configuration_fingerprint);
 
     for (const auto& output : task.outputs) {
-        const Path output_path = fs::join(root, output);
-        if (!fs::exists(output_path)) {
+        if (!fs::exists(fs::join(root, output))) {
             status.reasons.push_back("output missing: " + output);
         }
     }
 
-    if (const cache::TaskCacheEntry* previous = cache.get(task.id)) {
+    if (previous) {
         if (previous->cache_key != status.cache_key) {
-            status.reasons.push_back("cache key changed");
+            status.reasons.push_back("command, toolchain or inputs changed");
         }
         for (const auto& [path, hash] : status.input_hashes) {
             const auto it = previous->input_hashes.find(path);
@@ -75,167 +102,249 @@ TaskStatus evaluate_task(
                 status.reasons.push_back("input changed: " + path);
             }
         }
+        for (const auto& [path, hash] : previous->discovered_hashes) {
+            const auto current = memo.hash(fs::join(root, path));
+            if (!current) {
+                status.reasons.push_back("dependency missing: " + path);
+            } else if (*current != hash) {
+                status.reasons.push_back("dependency changed: " + path);
+            }
+        }
     } else if (task.has_command()) {
         status.reasons.push_back("no previous cache entry");
     }
 
-    status.up_to_date = task.has_command() && status.reasons.empty();
-    if (!task.has_command()) {
-        status.up_to_date = true;
-    }
-
+    status.up_to_date = !task.has_command() || status.reasons.empty();
     return status;
 }
 
-bool run_task(
-    const config::ProjectConfig& config,
-    const graph::Task& task,
-    const TaskStatus& status,
-    cache::CacheStore& cache,
-    const ExecutorOptions& options,
-    std::mutex& cache_mutex,
-    std::mutex& log_mutex) {
-    if (status.up_to_date) {
-        if (options.verbose) {
-            std::lock_guard lock(log_mutex);
-            std::cout << "skip " << task.id.value << '\n';
+/// CRLF -> LF, and guarantee a trailing newline for non-empty text.
+std::string normalize_output(std::string text) {
+    std::string out;
+    out.reserve(text.size() + 1);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\r' && i + 1 < text.size() && text[i + 1] == '\n') {
+            continue;
         }
+        out.push_back(text[i]);
+    }
+    if (!out.empty() && out.back() != '\n') {
+        out.push_back('\n');
+    }
+    return out;
+}
+
+std::string msvc_deps_prefix() {
+#ifdef _MSC_VER
+    char* value = nullptr;
+    std::size_t length = 0;
+    std::string prefix;
+    if (_dupenv_s(&value, &length, "LUMA_MSVC_DEPS_PREFIX") == 0 && value) {
+        prefix = value;
+        std::free(value);
+    }
+#else
+    const char* raw = std::getenv("LUMA_MSVC_DEPS_PREFIX");
+    std::string prefix = raw ? raw : "";
+#endif
+    return prefix.empty() ? std::string(kMsvcShowIncludesPrefix) : prefix;
+}
+
+struct Scheduler {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::string> ready;
+    std::unordered_map<std::string, std::size_t> remaining_deps;
+    std::unordered_map<std::string, std::vector<std::string>> dependents;
+    std::size_t in_flight = 0;
+    bool failed = false;
+};
+
+struct RunContext {
+    RunContext(
+        const config::ProjectConfig& config_,
+        const config::BuildPlan& plan_,
+        cache::CacheStore& cache_,
+        const ExecutorOptions& options_,
+        const std::unordered_map<std::string, bool>& planned_,
+        std::size_t planned_total_,
+        HashMemo& memo_)
+        : config(config_), plan(plan_), cache(cache_), options(options_), planned(planned_),
+          planned_total(planned_total_), memo(memo_) {}
+
+    const config::ProjectConfig& config;
+    const config::BuildPlan& plan;
+    cache::CacheStore& cache;
+    const ExecutorOptions& options;
+    const std::unordered_map<std::string, bool>& planned;
+    std::size_t planned_total = 0;
+    HashMemo& memo;
+
+    std::mutex cache_mutex;
+    std::mutex log_mutex;
+    std::size_t progress = 0;
+    std::size_t tasks_run = 0;
+    std::size_t tasks_skipped = 0;
+    std::size_t tasks_failed = 0;
+};
+
+/// Print one task's progress block atomically.
+void report(RunContext& ctx, const graph::Task& task, const std::string& output) {
+    std::string verb = metadata_value(task, meta::kVerb);
+    std::string description = metadata_value(task, meta::kDescription);
+    if (verb.empty()) {
+        verb = "run";
+    }
+    if (description.empty()) {
+        description = task.id.value;
+    }
+
+    std::lock_guard lock(ctx.log_mutex);
+    ++ctx.progress;
+    std::string block = "[" + std::to_string(ctx.progress) + "/" + std::to_string(ctx.planned_total) +
+                        "] " + verb + " " + description + "\n";
+    if (ctx.options.verbose || ctx.options.dry_run) {
+        block += format_command(task.command) + "\n";
+    }
+    block += output;
+    std::cout << block << std::flush;
+}
+
+/// Run one out-of-date task. Returns false if its command failed.
+bool run_task(RunContext& ctx, const graph::Task& task) {
+    const Path& root = ctx.config.root;
+
+    if (ctx.options.dry_run) {
+        report(ctx, task, {});
         return true;
     }
 
-    if (options.dry_run) {
-        std::lock_guard lock(log_mutex);
-        std::cout << "would run: " << format_command(task.command) << '\n';
-        return true;
+    // Re-evaluate now that all dependencies have finished: their outputs are
+    // this task's inputs and the cache entry must record their new hashes.
+    std::optional<cache::TaskCacheEntry> previous;
+    {
+        std::lock_guard lock(ctx.cache_mutex);
+        if (const cache::TaskCacheEntry* entry = ctx.cache.get(task.id)) {
+            previous = *entry;
+        }
     }
+    const TaskStatus status =
+        evaluate_task(task, previous ? &*previous : nullptr, ctx.plan, root, ctx.memo);
 
     for (const auto& output : task.outputs) {
-        const Path output_path = fs::join(config.root, output);
-        const auto slash = output_path.find_last_of('/');
-        if (slash != Path::npos) {
-            fs::create_directories(output_path.substr(0, slash));
-        }
+        const Path output_path = fs::join(root, output);
+        // Never let a stale output survive a failed or partial run (and keep
+        // `ar` from appending to an old archive).
+        fs::remove_all(output_path);
+        fs::create_directories(fs::parent(output_path));
+        ctx.memo.forget(output_path);
     }
 
-    if (options.verbose) {
-        std::lock_guard lock(log_mutex);
-        std::cout << "run " << format_command(task.command) << '\n';
-    }
+    const std::string cwd = task.working_directory ? *task.working_directory : root;
+    const ProcessResult process = run_process(task.command, cwd, /*merge_output=*/true);
 
-    const std::string cwd = task.working_directory ? *task.working_directory : config.root;
-    const auto process = run_process(task.command, cwd);
-    if (process.exit_code != 0) {
-        std::lock_guard lock(log_mutex);
-        std::cerr << "error[LUMA001]: failed to run task " << task.id.value << '\n';
-        std::cerr << "  command: " << format_command(task.command) << '\n';
-        if (!process.stdout_text.empty()) {
-            std::cerr << process.stdout_text << '\n';
-        }
-        if (!process.stderr_text.empty()) {
-            std::cerr << process.stderr_text << '\n';
-        }
+    const std::string deps_format = metadata_value(task, meta::kDepsFormat);
+    std::string output = process.stdout_text;
+    std::vector<Path> discovered;
+
+    if (deps_format == "msvc") {
+        const std::string source = metadata_value(task, meta::kSource);
+        auto scan = scan_msvc_output(output, fs::filename(source), msvc_deps_prefix());
+        output = std::move(scan.output);
+        discovered = std::move(scan.includes);
+    }
+    output = normalize_output(std::move(output));
+
+    const bool ok = process.exit_code == 0;
+    report(ctx, task, output);
+
+    if (!ok) {
+        std::lock_guard lock(ctx.log_mutex);
+        std::cerr << "luma: error: task '" << task.id.value << "' failed with exit code "
+                  << process.exit_code << "\n  command: " << format_command(task.command) << '\n'
+                  << std::flush;
         return false;
     }
 
-    {
-        std::lock_guard lock(cache_mutex);
-        cache.put(task.id, cache::TaskCacheEntry{
-                               .cache_key = status.cache_key,
-                               .input_hashes = status.input_hashes,
-                           });
+    if (deps_format == "gcc") {
+        const Path depfile = fs::join(root, metadata_value(task, meta::kDepfile));
+        std::ifstream in(fs::to_native(depfile), std::ios::binary);
+        if (in) {
+            const std::string content{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+            discovered = parse_gcc_depfile(content);
+        }
     }
+
+    cache::TaskCacheEntry entry{
+        .cache_key = status.cache_key,
+        .input_hashes = status.input_hashes,
+        .discovered_hashes = {},
+    };
+    const std::string source = metadata_value(task, meta::kSource);
+    const Path source_abs = source.empty() ? Path{} : fs::join(root, source);
+    for (const auto& dep : discovered) {
+        const Path dep_abs = fs::join(root, dep);
+        if (dep_abs == source_abs) {
+            continue;
+        }
+        if (const auto hash = ctx.memo.hash(dep_abs)) {
+            entry.discovered_hashes[dep] = *hash;
+        }
+    }
+
+    std::lock_guard lock(ctx.cache_mutex);
+    ctx.cache.put(task.id, std::move(entry));
     return true;
 }
 
-struct ScheduleState {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<graph::TaskId> ready;
-    std::unordered_map<std::string, std::size_t> remaining_deps;
-    std::unordered_map<std::string, std::vector<std::string>> dependents;
-    std::atomic<bool> stop{false};
-    std::atomic<bool> failed{false};
-    std::atomic<std::size_t> in_flight{0};
-    std::size_t total = 0;
-};
-
-void worker_loop(
-    ScheduleState& state,
-    const config::ProjectConfig& config,
-    const config::BuildPlan& plan,
-    cache::CacheStore& cache,
-    const ExecutorOptions& options,
-    const std::unordered_map<std::string, TaskStatus>& statuses,
-    std::mutex& cache_mutex,
-    std::mutex& log_mutex,
-    std::atomic<std::size_t>& tasks_run,
-    std::atomic<std::size_t>& tasks_skipped) {
+void worker_loop(Scheduler& sched, RunContext& ctx) {
     while (true) {
-        graph::TaskId task_id{""};
-
+        std::string task_id;
         {
-            std::unique_lock lock(state.mutex);
-            state.cv.wait(lock, [&]() {
-                return state.stop.load() || !state.ready.empty();
+            std::unique_lock lock(sched.mutex);
+            sched.cv.wait(lock, [&]() {
+                return (!sched.ready.empty() && !sched.failed) || sched.in_flight == 0;
             });
-
-            if (state.stop.load() && state.ready.empty()) {
+            if (sched.failed || sched.ready.empty()) {
+                // Either everything reachable has finished, or a task failed
+                // and no new work may start.
+                sched.cv.notify_all();
                 return;
             }
-            if (state.ready.empty()) {
-                continue;
-            }
-
-            task_id = state.ready.front();
-            state.ready.pop();
-            ++state.in_flight;
+            task_id = std::move(sched.ready.front());
+            sched.ready.pop_front();
+            ++sched.in_flight;
         }
 
-        const graph::Task* task = plan.graph.find_task(task_id);
-        if (!task) {
-            continue;
-        }
-
-        const TaskStatus& status = statuses.at(task_id.value);
+        const graph::Task* task = ctx.plan.graph.find_task(graph::TaskId{task_id});
         bool ok = true;
-
-        if (!task->has_command()) {
-            ++tasks_skipped;
-        } else if (status.up_to_date) {
-            ++tasks_skipped;
-            ok = run_task(config, *task, status, cache, options, cache_mutex, log_mutex);
-        } else {
-            ok = run_task(config, *task, status, cache, options, cache_mutex, log_mutex);
+        if (task && ctx.planned.at(task_id)) {
+            ok = run_task(ctx, *task);
+            std::lock_guard lock(ctx.log_mutex);
             if (ok) {
-                ++tasks_run;
+                ++ctx.tasks_run;
+            } else {
+                ++ctx.tasks_failed;
             }
-        }
-
-        if (!ok) {
-            state.failed = true;
-            state.stop = true;
+        } else {
+            std::lock_guard lock(ctx.log_mutex);
+            ++ctx.tasks_skipped;
         }
 
         {
-            std::lock_guard lock(state.mutex);
+            std::lock_guard lock(sched.mutex);
+            --sched.in_flight;
             if (ok) {
-                for (const auto& dependent : state.dependents[task_id.value]) {
-                    auto& deps = state.remaining_deps[dependent];
-                    if (deps > 0) {
-                        --deps;
-                        if (deps == 0 && !state.stop.load()) {
-                            state.ready.push(graph::TaskId{dependent});
-                        }
+                for (const auto& dependent : sched.dependents[task_id]) {
+                    if (--sched.remaining_deps[dependent] == 0) {
+                        sched.ready.push_back(dependent);
                     }
                 }
+            } else {
+                sched.failed = true;
             }
-
-            --state.in_flight;
-            if (state.ready.empty() && state.in_flight.load() == 0) {
-                state.stop = true;
-            }
-            state.cv.notify_all();
         }
+        sched.cv.notify_all();
     }
 }
 
@@ -251,69 +360,77 @@ ExecuteResult execute(
         return result;
     }
 
-    if (!plan.graph.topological_order()) {
+    const auto order = plan.graph.topological_order();
+    if (!order) {
+        std::cerr << "luma: error: the build graph contains a cycle\n";
         result.exit_code = 1;
         return result;
     }
 
-    std::unordered_map<std::string, TaskStatus> statuses;
-    statuses.reserve(plan.graph.size());
-    for (const auto& [id, task] : plan.graph.tasks()) {
-        statuses.emplace(id.value, evaluate_task(task, cache, plan, config.root));
+    HashMemo memo;
+
+    // A task runs if it is out of date itself or if anything it depends on
+    // runs. Deciding this up front gives a fixed task count for progress.
+    std::unordered_map<std::string, bool> planned;
+    std::size_t planned_total = 0;
+    for (const auto& id : *order) {
+        const graph::Task& task = *plan.graph.find_task(id);
+        const TaskStatus status = evaluate_task(task, cache.get(id), plan, config.root, memo);
+        bool runs = task.has_command() && !status.up_to_date;
+        std::vector<std::string> reasons = status.reasons;
+        for (const auto& dep : task.dependencies) {
+            if (planned.at(dep.value)) {
+                if (!runs && task.has_command()) {
+                    reasons.push_back("dependency will be rebuilt: " + dep.value);
+                }
+                runs = runs || task.has_command();
+            }
+        }
+        planned[id.value] = runs;
+        planned_total += runs ? 1 : 0;
         result.explanations.push_back(TaskExplanation{
             .id = id,
-            .would_run = task.has_command() && !statuses[id.value].up_to_date,
-            .reasons = statuses[id.value].reasons,
+            .would_run = runs,
+            .reasons = std::move(reasons),
         });
     }
 
-    ScheduleState schedule;
-    schedule.total = plan.graph.size();
-
-    for (const auto& [id, task] : plan.graph.tasks()) {
-        schedule.remaining_deps[id.value] = task.dependencies.size();
+    Scheduler sched;
+    for (const auto& id : *order) {
+        const graph::Task& task = *plan.graph.find_task(id);
+        sched.remaining_deps[id.value] = task.dependencies.size();
         for (const auto& dep : task.dependencies) {
-            schedule.dependents[dep.value].push_back(id.value);
+            sched.dependents[dep.value].push_back(id.value);
         }
         if (task.dependencies.empty()) {
-            schedule.ready.push(id);
+            sched.ready.push_back(id.value);
         }
     }
 
     const std::size_t jobs = options.jobs == 0
         ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
-        : std::max<std::size_t>(1, options.jobs);
+        : options.jobs;
 
-    std::mutex cache_mutex;
-    std::mutex log_mutex;
-    std::atomic<std::size_t> tasks_run{0};
-    std::atomic<std::size_t> tasks_skipped{0};
+    RunContext ctx(config, plan, cache, options, planned, planned_total, memo);
 
     std::vector<std::thread> workers;
-    workers.reserve(jobs);
-    for (std::size_t i = 0; i < jobs; ++i) {
-        workers.emplace_back(worker_loop,
-            std::ref(schedule),
-            std::cref(config),
-            std::cref(plan),
-            std::ref(cache),
-            std::cref(options),
-            std::cref(statuses),
-            std::ref(cache_mutex),
-            std::ref(log_mutex),
-            std::ref(tasks_run),
-            std::ref(tasks_skipped));
+    const std::size_t worker_count = std::min(jobs, std::max<std::size_t>(1, planned_total));
+    workers.reserve(worker_count);
+    for (std::size_t i = 0; i < worker_count; ++i) {
+        workers.emplace_back(worker_loop, std::ref(sched), std::ref(ctx));
     }
-
     for (auto& worker : workers) {
         worker.join();
     }
 
-    result.tasks_run = tasks_run.load();
-    result.tasks_skipped = tasks_skipped.load();
-    result.exit_code = schedule.failed.load() ? 1 : 0;
+    result.tasks_run = ctx.tasks_run;
+    result.tasks_skipped = ctx.tasks_skipped;
+    result.tasks_failed = ctx.tasks_failed;
+    result.exit_code = sched.failed ? 1 : 0;
 
-    cache.save();
+    if (!options.dry_run) {
+        cache.save();
+    }
     return result;
 }
 
@@ -328,12 +445,13 @@ std::vector<TaskExplanation> explain_target(
         return explanations;
     }
 
+    HashMemo memo;
     for (const auto& task_id : it->second) {
         const graph::Task* task = plan.graph.find_task(task_id);
         if (!task) {
             continue;
         }
-        const TaskStatus status = evaluate_task(*task, cache, plan, root);
+        const TaskStatus status = evaluate_task(*task, cache.get(task_id), plan, root, memo);
         explanations.push_back(TaskExplanation{
             .id = task_id,
             .would_run = !status.up_to_date,

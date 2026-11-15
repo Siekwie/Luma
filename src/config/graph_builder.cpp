@@ -6,8 +6,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <sstream>
-#include <unordered_set>
 #include <unordered_set>
 
 namespace luma::config {
@@ -18,7 +18,6 @@ using luma::fs::glob;
 using luma::fs::join;
 using luma::fs::normalize;
 using luma::fs::relative_to;
-using luma::fs::stem;
 
 std::string to_lower(std::string value) {
     for (char& c : value) {
@@ -27,18 +26,34 @@ std::string to_lower(std::string value) {
     return value;
 }
 
-TargetKind parse_kind(const std::string& kind) {
-    const std::string lower = to_lower(kind);
-    if (lower == "executable" || lower == "exe" || lower == "app") {
-        return TargetKind::Executable;
+template <typename T>
+void append(std::vector<T>& out, const std::vector<T>& values) {
+    out.insert(out.end(), values.begin(), values.end());
+}
+
+template <typename T>
+void append_unique(std::vector<T>& out, const std::vector<T>& values) {
+    for (const auto& value : values) {
+        if (std::find(out.begin(), out.end(), value) == out.end()) {
+            out.push_back(value);
+        }
     }
-    if (lower == "static_library" || lower == "static" || lower == "lib") {
-        return TargetKind::StaticLibrary;
-    }
-    if (lower == "shared_library" || lower == "shared" || lower == "dll") {
-        return TargetKind::SharedLibrary;
-    }
-    return TargetKind::Executable;
+}
+
+bool is_windows_host() {
+#ifdef _WIN32
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool is_apple_host() {
+#ifdef __APPLE__
+    return true;
+#else
+    return false;
+#endif
 }
 
 std::vector<Path> resolve_sources(const ProjectConfig& config, const TargetDef& target) {
@@ -46,7 +61,7 @@ std::vector<Path> resolve_sources(const ProjectConfig& config, const TargetDef& 
     std::vector<Path> sources;
 
     auto add = [&](Path path) {
-        path = normalize(path);
+        path = fs::lexically_normal(path);
         if (seen.insert(path).second) {
             sources.push_back(std::move(path));
         }
@@ -65,81 +80,58 @@ std::vector<Path> resolve_sources(const ProjectConfig& config, const TargetDef& 
     return sources;
 }
 
-std::vector<std::string> merged_defines(
-    const ProfileDef* profile,
-    const TargetDef& target) {
-    std::vector<std::string> out;
-    if (profile) {
-        out.insert(out.end(), profile->defines.begin(), profile->defines.end());
-    }
-    out.insert(out.end(), target.defines.begin(), target.defines.end());
-    return out;
-}
-
-std::vector<std::string> merged_cxxflags(
-    const ProfileDef* profile,
-    const TargetDef& target) {
-    std::vector<std::string> out;
-    if (profile) {
-        out.insert(out.end(), profile->cxxflags.begin(), profile->cxxflags.end());
-    }
-    out.insert(out.end(), target.cxxflags.begin(), target.cxxflags.end());
-    return out;
-}
-
-std::vector<std::string> merged_linkflags(
-    const ProfileDef* profile,
-    const TargetDef& target) {
-    std::vector<std::string> out;
-    if (profile) {
-        out.insert(out.end(), profile->linkflags.begin(), profile->linkflags.end());
-    }
-    out.insert(out.end(), target.linkflags.begin(), target.linkflags.end());
-    return out;
-}
-
 std::string object_extension(const ToolchainDef& toolchain) {
     return toolchain.style == ToolchainStyle::Msvc ? ".obj" : ".o";
 }
 
 std::string library_prefix(const ToolchainDef& toolchain) {
-    (void)toolchain;
-    return "lib";
+    return toolchain.style == ToolchainStyle::Msvc ? "" : "lib";
 }
 
 std::string library_extension(const ToolchainDef& toolchain, TargetKind kind) {
     if (kind == TargetKind::SharedLibrary) {
-#ifdef _WIN32
-        return toolchain.style == ToolchainStyle::Msvc ? ".dll" : ".dll";
-#else
-        return ".so";
-#endif
+        if (is_windows_host()) {
+            return ".dll";
+        }
+        return is_apple_host() ? ".dylib" : ".so";
     }
-#ifdef _WIN32
     return toolchain.style == ToolchainStyle::Msvc ? ".lib" : ".a";
-#else
-    return ".a";
-#endif
 }
 
-std::string executable_extension(const ToolchainDef& toolchain) {
-#ifdef _WIN32
-    (void)toolchain;
-    return ".exe";
-#else
-    (void)toolchain;
-    return "";
-#endif
+std::string executable_extension() {
+    return is_windows_host() ? ".exe" : "";
 }
 
+/// Object file for a source: <build>/obj/<target>/<source path>.o, so that
+/// sources with equal stems in different directories do not collide.
 Path object_path(
     const ProjectConfig& config,
     const std::string& target_name,
     const Path& source,
     const ToolchainDef& toolchain) {
-    const Path rel = relative_to(source, config.root);
-    const std::string obj = stem(rel) + object_extension(toolchain);
-    return join(join(join(config.build_dir, "obj"), target_name), obj);
+    std::string rel = relative_to(join(config.root, source), config.root);
+    // Keep objects inside the build directory even for sources outside the root.
+    std::string sanitized;
+    std::size_t start = 0;
+    while (start <= rel.size()) {
+        const std::size_t slash = rel.find('/', start);
+        std::string segment = rel.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (segment == "..") {
+            segment = "__";
+        }
+        std::replace(segment.begin(), segment.end(), ':', '_');
+        if (!segment.empty()) {
+            if (!sanitized.empty()) {
+                sanitized += '/';
+            }
+            sanitized += segment;
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return join(join(join(config.build_dir, "obj"), target_name), sanitized + object_extension(toolchain));
 }
 
 Path output_path(
@@ -147,134 +139,146 @@ Path output_path(
     const TargetDef& target,
     const ToolchainDef& toolchain) {
     if (target.kind == TargetKind::Executable) {
-        return join(config.build_dir, target.name + executable_extension(toolchain));
+        return join(config.build_dir, target.name + executable_extension());
     }
     return join(
         config.build_dir,
         library_prefix(toolchain) + target.name + library_extension(toolchain, target.kind));
 }
 
+/// File passed to the linker when linking against a target.
+Path link_input_path(const Path& output, const TargetDef& target, const ToolchainDef& toolchain) {
+    if (target.kind == TargetKind::SharedLibrary && toolchain.style == ToolchainStyle::Msvc) {
+        // MSVC links against the import library written next to the DLL.
+        return output.substr(0, output.size() - 4) + ".lib";
+    }
+    return output;
+}
+
+struct CompileInputs {
+    SourceLanguage language = SourceLanguage::Cxx;
+    std::vector<std::string> flags;
+    std::vector<std::string> defines;
+    std::vector<Path> include_dirs;
+    Path source;
+    Path object;
+};
+
 std::vector<std::string> gnu_compile_command(
-    const ToolchainDef& toolchain,
-    const std::vector<std::string>& flags,
-    const std::vector<std::string>& defines,
-    const std::vector<Path>& include_dirs,
-    const Path& source,
-    const Path& output,
-    const Path& root) {
-    std::vector<std::string> cmd = {toolchain.cxx};
-    cmd.insert(cmd.end(), flags.begin(), flags.end());
-    for (const auto& define : defines) {
+    const ToolchainDef& toolchain, const CompileInputs& in, const Path& root) {
+    std::vector<std::string> cmd = {in.language == SourceLanguage::C ? toolchain.cc : toolchain.cxx};
+    append(cmd, in.flags);
+    for (const auto& define : in.defines) {
         cmd.push_back("-D" + define);
     }
-    for (const auto& include : include_dirs) {
+    for (const auto& include : in.include_dirs) {
         cmd.push_back("-I" + join(root, include));
     }
+    cmd.push_back("-MMD");
     cmd.push_back("-c");
-    cmd.push_back(join(root, source));
+    cmd.push_back(join(root, in.source));
     cmd.push_back("-o");
-    cmd.push_back(join(root, output));
+    cmd.push_back(join(root, in.object));
     return cmd;
 }
 
 std::vector<std::string> msvc_compile_command(
-    const ToolchainDef& toolchain,
-    const std::vector<std::string>& flags,
-    const std::vector<std::string>& defines,
-    const std::vector<Path>& include_dirs,
-    const Path& source,
-    const Path& output,
-    const Path& root) {
-    std::vector<std::string> cmd = {toolchain.cxx, "/nologo", "/c", "/EHsc"};
-    cmd.insert(cmd.end(), flags.begin(), flags.end());
-    for (const auto& define : defines) {
+    const ToolchainDef& toolchain, const CompileInputs& in, const Path& root) {
+    std::vector<std::string> cmd = {
+        in.language == SourceLanguage::C ? toolchain.cc : toolchain.cxx, "/nologo", "/showIncludes", "/c"};
+    if (in.language == SourceLanguage::Cxx) {
+        cmd.push_back("/EHsc");
+    }
+    append(cmd, in.flags);
+    for (const auto& define : in.defines) {
         cmd.push_back("/D" + define);
     }
-    for (const auto& include : include_dirs) {
+    for (const auto& include : in.include_dirs) {
         cmd.push_back("/I" + join(root, include));
     }
-    cmd.push_back("/Fo" + join(root, output));
-    cmd.push_back(join(root, source));
+    cmd.push_back("/Fo" + join(root, in.object));
+    cmd.push_back(join(root, in.source));
     return cmd;
 }
 
 std::vector<std::string> compile_command(
-    const ToolchainDef& toolchain,
-    const std::vector<std::string>& flags,
-    const std::vector<std::string>& defines,
-    const std::vector<Path>& include_dirs,
-    const Path& source,
-    const Path& output,
-    const Path& root) {
+    const ToolchainDef& toolchain, const CompileInputs& in, const Path& root) {
     if (toolchain.style == ToolchainStyle::Msvc) {
-        return msvc_compile_command(toolchain, flags, defines, include_dirs, source, output, root);
+        return msvc_compile_command(toolchain, in, root);
     }
-    return gnu_compile_command(toolchain, flags, defines, include_dirs, source, output, root);
+    return gnu_compile_command(toolchain, in, root);
 }
 
-std::vector<std::string> gnu_link_executable(
-    const ToolchainDef& toolchain,
-    const std::vector<std::string>& linkflags,
-    const std::vector<Path>& objects,
-    const std::vector<Path>& libraries,
-    const std::vector<std::string>& system_libs,
-    const Path& output,
-    const Path& root) {
-    const std::string linker = toolchain.linker.empty() ? toolchain.cxx : toolchain.linker;
+struct LinkInputs {
+    TargetKind kind = TargetKind::Executable;
+    bool has_cxx = true;
+    std::vector<std::string> linkflags;
+    std::vector<Path> objects;
+    std::vector<Path> libraries;
+    std::vector<std::string> system_libs;
+    std::vector<Path> rpath_dirs;
+    Path output;
+};
+
+std::vector<std::string> gnu_link_command(
+    const ToolchainDef& toolchain, const LinkInputs& in, const Path& root) {
+    std::string linker = toolchain.linker;
+    if (linker.empty()) {
+        linker = in.has_cxx ? toolchain.cxx : toolchain.cc;
+    }
     std::vector<std::string> cmd = {linker};
-    cmd.insert(cmd.end(), linkflags.begin(), linkflags.end());
-    for (const auto& object : objects) {
+    if (in.kind == TargetKind::SharedLibrary) {
+        cmd.push_back("-shared");
+    }
+    append(cmd, in.linkflags);
+    for (const auto& object : in.objects) {
         cmd.push_back(join(root, object));
     }
-    for (const auto& library : libraries) {
+    for (const auto& library : in.libraries) {
         cmd.push_back(join(root, library));
     }
-    for (const auto& lib : system_libs) {
+    for (const auto& dir : in.rpath_dirs) {
+        cmd.push_back("-Wl,-rpath," + join(root, dir));
+    }
+    for (const auto& lib : in.system_libs) {
         cmd.push_back("-l" + lib);
     }
     cmd.push_back("-o");
-    cmd.push_back(join(root, output));
+    cmd.push_back(join(root, in.output));
     return cmd;
 }
 
-std::vector<std::string> msvc_link_executable(
-    const ToolchainDef& toolchain,
-    const std::vector<std::string>& linkflags,
-    const std::vector<Path>& objects,
-    const std::vector<Path>& libraries,
-    const std::vector<std::string>& system_libs,
-    const Path& output,
-    const Path& root) {
+std::vector<std::string> msvc_link_command(
+    const ToolchainDef& toolchain, const LinkInputs& in, const Path& root) {
     const std::string linker = toolchain.linker.empty() ? "link" : toolchain.linker;
     std::vector<std::string> cmd = {linker, "/nologo"};
-    cmd.insert(cmd.end(), linkflags.begin(), linkflags.end());
-    for (const auto& object : objects) {
+    if (in.kind == TargetKind::SharedLibrary) {
+        cmd.push_back("/DLL");
+    }
+    append(cmd, in.linkflags);
+    for (const auto& object : in.objects) {
         cmd.push_back(join(root, object));
     }
-    for (const auto& library : libraries) {
+    for (const auto& library : in.libraries) {
         cmd.push_back(join(root, library));
     }
-    for (const auto& lib : system_libs) {
-        cmd.push_back(lib + ".lib");
+    for (const auto& lib : in.system_libs) {
+        cmd.push_back(lib.ends_with(".lib") ? lib : lib + ".lib");
     }
-    cmd.push_back("/OUT:" + join(root, output));
+    cmd.push_back("/OUT:" + join(root, in.output));
+    if (in.kind == TargetKind::SharedLibrary) {
+        const Path output = join(root, in.output);
+        cmd.push_back("/IMPLIB:" + output.substr(0, output.size() - 4) + ".lib");
+    }
     return cmd;
 }
 
-std::vector<std::string> link_executable_command(
-    const ToolchainDef& toolchain,
-    const std::vector<std::string>& linkflags,
-    const std::vector<Path>& objects,
-    const std::vector<Path>& libraries,
-    const std::vector<std::string>& system_libs,
-    const Path& output,
-    const Path& root) {
+std::vector<std::string> link_command(
+    const ToolchainDef& toolchain, const LinkInputs& in, const Path& root) {
     if (toolchain.style == ToolchainStyle::Msvc) {
-        return msvc_link_executable(
-            toolchain, linkflags, objects, libraries, system_libs, output, root);
+        return msvc_link_command(toolchain, in, root);
     }
-    return gnu_link_executable(
-        toolchain, linkflags, objects, libraries, system_libs, output, root);
+    return gnu_link_command(toolchain, in, root);
 }
 
 std::vector<std::string> archive_command(
@@ -282,15 +286,14 @@ std::vector<std::string> archive_command(
     const std::vector<Path>& objects,
     const Path& output,
     const Path& root) {
+    std::vector<std::string> cmd;
     if (toolchain.style == ToolchainStyle::Msvc) {
-        std::vector<std::string> cmd = {"lib", "/nologo", "/OUT:" + join(root, output)};
-        for (const auto& object : objects) {
-            cmd.push_back(join(root, object));
-        }
-        return cmd;
+        const std::string archiver =
+            toolchain.archiver.empty() || toolchain.archiver == "ar" ? "lib" : toolchain.archiver;
+        cmd = {archiver, "/nologo", "/OUT:" + join(root, output)};
+    } else {
+        cmd = {toolchain.archiver.empty() ? "ar" : toolchain.archiver, "rcs", join(root, output)};
     }
-
-    std::vector<std::string> cmd = {toolchain.archiver, "rcs", join(root, output)};
     for (const auto& object : objects) {
         cmd.push_back(join(root, object));
     }
@@ -329,27 +332,81 @@ std::vector<std::string> expand_generate_command(
     return cmd;
 }
 
+/// Salt mixed into every task's cache key. Everything that shapes a task's
+/// command line is already part of the key, so this only names the profile.
 std::string fingerprint_config(const ProjectConfig& config, const ProfileDef* profile) {
     std::ostringstream out;
     out << "profile=" << config.profile << '\n';
-    if (profile) {
-        for (const auto& flag : profile->cxxflags) {
-            out << "p_cxx=" << flag << '\n';
-        }
-        for (const auto& define : profile->defines) {
-            out << "p_def=" << define << '\n';
-        }
-    }
-    for (const auto& [name, target] : config.targets) {
-        out << "target=" << name << '\n';
-        for (const auto& flag : target.cxxflags) {
-            out << "t_cxx=" << flag << '\n';
-        }
-    }
+    out << "lto=" << ((profile && profile->lto) ? 1 : 0) << '\n';
     return out.str();
 }
 
+/// Dependencies of `root_name` in link order (dependents before their
+/// dependencies), each listed once. With `through_shared` false, the walk
+/// does not descend into the dependencies of shared libraries, which already
+/// contain them.
+std::vector<std::string> transitive_dependencies(
+    const ProjectConfig& config, const std::string& root_name, bool through_shared) {
+    std::vector<std::string> post_order;
+    std::unordered_set<std::string> visited;
+    std::function<void(const std::string&, bool)> visit = [&](const std::string& name, bool is_root) {
+        if (!visited.insert(name).second) {
+            return;
+        }
+        const TargetDef* target = find_target(config, name);
+        if (!target) {
+            return;
+        }
+        if (is_root || through_shared || target->kind != TargetKind::SharedLibrary) {
+            for (const auto& dep : target->dependencies) {
+                visit(dep, false);
+            }
+        }
+        if (!is_root) {
+            post_order.push_back(name);
+        }
+    };
+    visit(root_name, true);
+    std::reverse(post_order.begin(), post_order.end());
+    return post_order;
+}
+
 } // namespace
+
+SourceLanguage source_language(const Path& path) {
+    const std::string ext = fs::extension(path);
+    if (ext == ".C") {
+        return is_windows_host() ? SourceLanguage::C : SourceLanguage::Cxx;
+    }
+    const std::string lower = to_lower(ext);
+    if (lower == ".c") {
+        return SourceLanguage::C;
+    }
+    if (lower == ".cpp" || lower == ".cc" || lower == ".cxx" || lower == ".c++" || lower == ".cp") {
+        return SourceLanguage::Cxx;
+    }
+    return SourceLanguage::Other;
+}
+
+std::string canonical_language(const std::string& language) {
+    const std::string lower = to_lower(language);
+    if (lower == "c") {
+        return "c";
+    }
+    return "cxx";
+}
+
+std::string kind_name(TargetKind kind) {
+    switch (kind) {
+    case TargetKind::Executable:
+        return "executable";
+    case TargetKind::StaticLibrary:
+        return "static_library";
+    case TargetKind::SharedLibrary:
+        return "shared_library";
+    }
+    return "executable";
+}
 
 std::optional<BuildPlanError> build_plan(
     const ProjectConfig& config,
@@ -364,40 +421,40 @@ std::optional<BuildPlanError> build_plan(
 
     out.graph = graph::BuildGraph{};
     out.target_tasks.clear();
+    out.targets.clear();
     out.toolchain_identity = toolchain::identity_string(toolchain);
     out.configuration_fingerprint = fingerprint_config(config, profile);
 
+    for (const auto& [name, target] : config.targets) {
+        for (const auto& dep : target.dependencies) {
+            if (!find_target(config, dep)) {
+                return BuildPlanError{
+                    "target '" + name + "' depends on unknown target '" + dep + "'"};
+            }
+        }
+    }
+
     std::vector<std::string> target_names;
     if (!only_targets.empty()) {
-        std::unordered_set<std::string> needed(only_targets.begin(), only_targets.end());
-        bool added = true;
-        while (added) {
-            added = false;
-            for (const auto& name : needed) {
-                const TargetDef* target = find_target(config, name);
-                if (!target) {
-                    return BuildPlanError{"unknown target: " + name};
-                }
-                for (const auto& dep : target->dependencies) {
-                    if (!needed.contains(dep)) {
-                        needed.insert(dep);
-                        added = true;
-                    }
-                }
+        std::unordered_set<std::string> needed;
+        for (const auto& name : only_targets) {
+            if (!find_target(config, name)) {
+                return BuildPlanError{"unknown target: " + name};
+            }
+            needed.insert(name);
+            for (const auto& dep : transitive_dependencies(config, name, true)) {
+                needed.insert(dep);
             }
         }
         target_names.assign(needed.begin(), needed.end());
-        std::sort(target_names.begin(), target_names.end());
     } else {
         for (const auto& [name, _] : config.targets) {
             target_names.push_back(name);
         }
-        std::sort(target_names.begin(), target_names.end());
     }
+    std::sort(target_names.begin(), target_names.end());
 
-    std::unordered_map<std::string, Path> target_outputs;
-    std::unordered_map<std::string, std::vector<graph::TaskId>> target_object_tasks;
-
+    std::vector<graph::TaskId> generator_tasks;
     for (const auto& generator : config.generators) {
         std::vector<Path> inputs = generator.inputs;
         for (const auto& pattern : generator.input_patterns) {
@@ -413,141 +470,204 @@ std::optional<BuildPlanError> build_plan(
                 .id = graph::TaskId{"gen:" + generator.name + ":" + output},
                 .inputs = inputs,
                 .outputs = {output},
+                .dependencies = {},
                 .command = expand_generate_command(generator, output, inputs, config.root),
+                .environment = {},
                 .working_directory = config.root,
-                .metadata = {{"generator", generator.name}, {"rule", "generate"}},
+                .cache_key = std::nullopt,
+                .metadata = {
+                    {meta::kRule, "generate"},
+                    {meta::kVerb, "generate"},
+                    {meta::kDescription, output},
+                    {"generator", generator.name},
+                },
             };
 
+            generator_tasks.push_back(task.id);
             if (const auto err = out.graph.add_task(std::move(task))) {
                 return BuildPlanError{err->message};
             }
         }
     }
 
-    for (const auto& target_name : target_names) {
-        const TargetDef* target_ptr = find_target(config, target_name);
-        if (!target_ptr) {
-            return BuildPlanError{"unknown target: " + target_name};
-        }
-        const TargetDef& target = *target_ptr;
-
-        const auto defines = merged_defines(profile, target);
-        const auto cxxflags = merged_cxxflags(profile, target);
-        const auto linkflags = merged_linkflags(profile, target);
-        const auto sources = resolve_sources(config, target);
-
-        if (sources.empty()) {
-            return BuildPlanError{"target '" + target.name + "' has no sources"};
-        }
-
-        std::vector<Path> include_dirs = target.include_dirs;
-        for (const auto& dep_name : target.dependencies) {
-            const TargetDef* dep = find_target(config, dep_name);
-            if (!dep) {
-                return BuildPlanError{
-                    "target '" + target.name + "' depends on unknown target '" + dep_name + "'"};
-            }
-            include_dirs.insert(include_dirs.end(), dep->include_dirs.begin(), dep->include_dirs.end());
-        }
-
-        std::vector<graph::TaskId> compile_tasks;
-        for (const auto& source : sources) {
-            const Path object = object_path(config, target.name, source, toolchain);
-            graph::TaskId task_id{"compile:" + target.name + ":" + source};
-
-            graph::Task compile_task{
-                .id = task_id,
-                .inputs = {source},
-                .outputs = {object},
-                .command = compile_command(
-                    toolchain, cxxflags, defines, include_dirs, source, object, config.root),
-                .working_directory = config.root,
-                .metadata = {{"target", target.name}, {"rule", "compile-cxx"}, {"source", source}},
-            };
-
-            if (const auto err = out.graph.add_task(std::move(compile_task))) {
-                return BuildPlanError{err->message};
-            }
-            compile_tasks.push_back(task_id);
-        }
-
-        target_object_tasks[target.name] = compile_tasks;
-        target_outputs[target.name] = output_path(config, target, toolchain);
+    std::unordered_map<std::string, Path> target_outputs;
+    for (const auto& name : target_names) {
+        target_outputs[name] = output_path(config, *find_target(config, name), toolchain);
     }
 
     for (const auto& target_name : target_names) {
         const TargetDef& target = *find_target(config, target_name);
-        const auto linkflags = merged_linkflags(profile, target);
-        const Path output = target_outputs.at(target.name);
-        const auto& compile_tasks = target_object_tasks.at(target.name);
 
+        std::vector<std::string> defines;
+        if (profile) {
+            append(defines, profile->defines);
+        }
+        append(defines, target.defines);
+
+        std::vector<std::string> cflags;
+        std::vector<std::string> cxxflags;
+        std::vector<std::string> linkflags;
+        if (profile) {
+            append(cflags, profile->cflags);
+            append(cxxflags, profile->cxxflags);
+            append(linkflags, profile->linkflags);
+        }
+        append(cflags, target.cflags);
+        append(cxxflags, target.cxxflags);
+        append(linkflags, target.linkflags);
+
+        if (target.kind == TargetKind::SharedLibrary && toolchain.style == ToolchainStyle::Gnu &&
+            !is_windows_host()) {
+            cflags.push_back("-fPIC");
+            cxxflags.push_back("-fPIC");
+        }
+
+        const auto sources = resolve_sources(config, target);
+        if (sources.empty()) {
+            return BuildPlanError{"target '" + target.name + "' has no sources"};
+        }
+
+        std::vector<Path> include_dirs;
+        append_unique(include_dirs, target.include_dirs);
+        for (const auto& dep_name : transitive_dependencies(config, target.name, true)) {
+            append_unique(include_dirs, find_target(config, dep_name)->include_dirs);
+        }
+
+        std::vector<graph::TaskId> compile_tasks;
         std::vector<Path> objects;
-        for (const auto& task_id : compile_tasks) {
-            const graph::Task* task = out.graph.find_task(task_id);
-            if (task && !task->outputs.empty()) {
-                objects.push_back(task->outputs.front());
+        bool has_cxx = false;
+        for (const auto& source : sources) {
+            const SourceLanguage language = source_language(source);
+            if (language == SourceLanguage::Other) {
+                continue; // headers and other files listed as sources are not compiled
+            }
+            has_cxx = has_cxx || language == SourceLanguage::Cxx;
+
+            const CompileInputs inputs{
+                .language = language,
+                .flags = language == SourceLanguage::C ? cflags : cxxflags,
+                .defines = defines,
+                .include_dirs = include_dirs,
+                .source = source,
+                .object = object_path(config, target.name, source, toolchain),
+            };
+
+            graph::Task compile_task{
+                .id = graph::TaskId{"compile:" + target.name + ":" + source},
+                .inputs = {source},
+                .outputs = {inputs.object},
+                .dependencies = generator_tasks,
+                .command = compile_command(toolchain, inputs, config.root),
+                .environment = {},
+                .working_directory = config.root,
+                .cache_key = std::nullopt,
+                .metadata = {
+                    {meta::kTarget, target.name},
+                    {meta::kRule, "compile"},
+                    {meta::kVerb, "compile"},
+                    {meta::kDescription, source},
+                    {meta::kLanguage, language == SourceLanguage::C ? "c" : "cxx"},
+                    {meta::kSource, source},
+                },
+            };
+            if (toolchain.style == ToolchainStyle::Msvc) {
+                compile_task.metadata[meta::kDepsFormat] = "msvc";
+            } else {
+                const Path& object = inputs.object;
+                compile_task.metadata[meta::kDepsFormat] = "gcc";
+                compile_task.metadata[meta::kDepfile] =
+                    object.substr(0, object.size() - object_extension(toolchain).size()) + ".d";
+            }
+
+            compile_tasks.push_back(compile_task.id);
+            objects.push_back(inputs.object);
+            if (const auto err = out.graph.add_task(std::move(compile_task))) {
+                return BuildPlanError{err->message};
             }
         }
 
+        if (objects.empty()) {
+            return BuildPlanError{"target '" + target.name + "' has no C or C++ sources"};
+        }
+
+        const Path output = target_outputs.at(target.name);
         std::vector<graph::TaskId> deps = compile_tasks;
-        std::vector<Path> libraries;
-        std::vector<Path> dep_include_dirs = target.include_dirs;
-
-        for (const auto& dep_name : target.dependencies) {
-            const auto dep_out = target_outputs.find(dep_name);
-            if (dep_out == target_outputs.end()) {
-                return BuildPlanError{
-                    "target '" + target.name + "' depends on unbuilt target '" + dep_name + "'"};
-            }
-            libraries.push_back(dep_out->second);
-            deps.push_back(graph::TaskId{"link:" + dep_name});
-
-            const auto dep_objects = target_object_tasks.find(dep_name);
-            if (dep_objects != target_object_tasks.end()) {
-                for (const auto& dep_task : dep_objects->second) {
-                    deps.push_back(dep_task);
-                }
-            }
-
-            if (const TargetDef* dep = find_target(config, dep_name)) {
-                dep_include_dirs.insert(
-                    dep_include_dirs.end(), dep->include_dirs.begin(), dep->include_dirs.end());
-            }
-        }
-
-        graph::TaskId link_id{"link:" + target.name};
         std::vector<std::string> command;
 
         if (target.kind == TargetKind::StaticLibrary) {
             command = archive_command(toolchain, objects, output, config.root);
         } else {
-            command = link_executable_command(
-                toolchain,
-                linkflags,
-                objects,
-                libraries,
-                target.system_libs,
-                output,
-                config.root);
+            LinkInputs link{
+                .kind = target.kind,
+                .has_cxx = has_cxx,
+                .linkflags = linkflags,
+                .objects = objects,
+                .libraries = {},
+                .system_libs = target.system_libs,
+                .rpath_dirs = {},
+                .output = output,
+            };
+            bool links_shared = false;
+            for (const auto& dep_name : transitive_dependencies(config, target.name, false)) {
+                const TargetDef& dep = *find_target(config, dep_name);
+                link.libraries.push_back(link_input_path(target_outputs.at(dep_name), dep, toolchain));
+                append_unique(link.system_libs, dep.system_libs);
+                links_shared = links_shared || dep.kind == TargetKind::SharedLibrary;
+                // A target needs every library it links to be up to date.
+                deps.push_back(graph::TaskId{"link:" + dep_name});
+            }
+            if (links_shared && toolchain.style == ToolchainStyle::Gnu && !is_windows_host() &&
+                !is_apple_host()) {
+                link.rpath_dirs.push_back(config.build_dir);
+            }
+            command = link_command(toolchain, link, config.root);
         }
 
+        // Linking against a static library also requires the libraries it
+        // depends on to exist, so wait for every transitive dependency.
+        for (const auto& dep_name : transitive_dependencies(config, target.name, true)) {
+            graph::TaskId dep_id{"link:" + dep_name};
+            if (std::find(deps.begin(), deps.end(), dep_id) == deps.end()) {
+                deps.push_back(dep_id);
+            }
+        }
+
+        const bool is_archive = target.kind == TargetKind::StaticLibrary;
         graph::Task link_task{
-            .id = link_id,
+            .id = graph::TaskId{"link:" + target.name},
             .inputs = objects,
             .outputs = {output},
             .dependencies = deps,
             .command = std::move(command),
+            .environment = {},
             .working_directory = config.root,
-            .metadata = {{"target", target.name}, {"rule", "link"}},
+            .cache_key = std::nullopt,
+            .metadata = {
+                {meta::kTarget, target.name},
+                {meta::kRule, is_archive ? "archive" : "link"},
+                {meta::kVerb, is_archive ? "archive" : "link"},
+                {meta::kDescription, output},
+            },
         };
+
+        auto& tasks = out.target_tasks[target.name];
+        tasks = compile_tasks;
+        tasks.push_back(link_task.id);
 
         if (const auto err = out.graph.add_task(std::move(link_task))) {
             return BuildPlanError{err->message};
         }
 
-        auto& tasks = out.target_tasks[target.name];
-        tasks = compile_tasks;
-        tasks.push_back(link_id);
+        out.targets.push_back(TargetInfo{
+            .name = target.name,
+            .kind = target.kind,
+            .language = canonical_language(target.language),
+            .output = output,
+            .sources = sources,
+            .include_dirs = include_dirs,
+            .defines = defines,
+            .dependencies = target.dependencies,
+        });
     }
 
     if (const auto err = out.graph.validate()) {
