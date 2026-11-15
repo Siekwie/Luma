@@ -174,7 +174,12 @@ disables this.
 A task runs when an output is missing, its command line, toolchain or any
 input content changed (SHA-256), a header it included changed (tracked
 through `-MMD` depfiles or MSVC `/showIncludes`), or a task it depends on
-runs. Fingerprints are stored in `.luma/cache/manifest.txt`. For localized
+runs. Fingerprints are stored in `.luma/cache/manifest.txt`. Content hashes
+are cached in `.luma/cache/hashes.txt` by file size and modification time, so
+unchanged files are not read again (a no-op build of a 150-task project takes
+about 0.1 s); a hash is only reused when it was taken at least 2 seconds after
+the file's last modification, so edits within the same timestamp tick are still
+seen. Deleting `.luma/cache` forces everything to be hashed again. For localized
 MSVC toolsets set `LUMA_MSVC_DEPS_PREFIX` to the translated
 `Note: including file:` prefix.
 
