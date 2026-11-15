@@ -342,7 +342,7 @@ bool valid_project_name(const std::string& name) {
 }
 
 bool write_new_file(const Path& path, const std::string& content) {
-    std::ofstream out(fs::to_native(path), std::ios::binary);
+    std::ofstream out(fs::to_fs_path(path), std::ios::binary);
     out << content;
     return static_cast<bool>(out.flush());
 }

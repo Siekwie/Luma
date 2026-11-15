@@ -296,7 +296,7 @@ bool run_task(RunContext& ctx, const graph::Task& task) {
 
     if (deps_format == "gcc") {
         const Path depfile = fs::join(root, metadata_value(task, meta::kDepfile));
-        std::ifstream in(fs::to_native(depfile), std::ios::binary);
+        std::ifstream in(fs::to_fs_path(depfile), std::ios::binary);
         if (in) {
             const std::string content{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
             discovered = parse_gcc_depfile(content);

@@ -11,7 +11,10 @@ extern "C" {
 #include "lualib.h"
 }
 
+#include <cctype>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 #include <vector>
 
@@ -105,10 +108,20 @@ bool read_bool_field(lua_State* L, int index, const char* key, bool default_valu
 }
 
 ToolchainStyle read_toolchain_style(const std::string& style, const std::string& cxx) {
-    if (style == "msvc" || cxx == "cl") {
+    if (style == "msvc") {
         return ToolchainStyle::Msvc;
     }
-    return ToolchainStyle::Gnu;
+    // Infer from the compiler's file name: "cl", "cl.exe", "C:/.../cl.exe",
+    // "clang-cl" and "clang-cl.exe" all take MSVC-style arguments.
+    const std::size_t slash = cxx.find_last_of("/\\");
+    std::string name = slash == std::string::npos ? cxx : cxx.substr(slash + 1);
+    for (char& c : name) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (name.ends_with(".exe")) {
+        name.resize(name.size() - 4);
+    }
+    return name == "cl" || name == "clang-cl" ? ToolchainStyle::Msvc : ToolchainStyle::Gnu;
 }
 
 /// Support the call-chaining form `target "name" { ... }`: when a
@@ -175,10 +188,11 @@ int api_toolchain(lua_State* L) {
     if (toolchain.cxx.empty()) {
         toolchain.cxx = "c++";
     }
-    if (toolchain.cc.empty()) {
-        toolchain.cc = "cc";
-    }
     toolchain.style = read_toolchain_style(kind, toolchain.cxx);
+    if (toolchain.cc.empty()) {
+        // cl.exe / clang-cl compile C and C++ alike; there is no "cc" next to them.
+        toolchain.cc = toolchain.style == ToolchainStyle::Msvc ? toolchain.cxx : "cc";
+    }
 
     if (auto* ctx = state(L)) {
         ctx->project->toolchains[name] = std::move(toolchain);
@@ -487,6 +501,36 @@ void register_api(lua_State* L) {
     lua_pop(L, 1);
 }
 
+/// luaL_dofile() equivalent that opens the file through std::filesystem:
+/// luaL_loadfile() uses fopen(), which on Windows reads a char* path in the
+/// ANSI code page, so UTF-8 project paths outside it could not be opened.
+/// Like luaL_loadfile(), skips a UTF-8 BOM and a first line starting with '#'.
+int run_script(lua_State* L, const Path& script_path) {
+    std::ifstream in(fs::to_fs_path(script_path), std::ios::binary);
+    if (!in) {
+        lua_pushfstring(L, "cannot open %s", script_path.c_str());
+        return LUA_ERRFILE;
+    }
+    std::string source{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    if (in.bad()) {
+        lua_pushfstring(L, "cannot read %s", script_path.c_str());
+        return LUA_ERRFILE;
+    }
+    if (source.starts_with("\xEF\xBB\xBF")) {
+        source.erase(0, 3);
+    }
+    if (source.starts_with("#")) {
+        // Keep the newline so that line numbers in error messages stay right.
+        source.erase(0, std::min(source.find('\n'), source.size()));
+    }
+    const std::string chunk_name = "@" + script_path;
+    if (const int status = luaL_loadbuffer(L, source.data(), source.size(), chunk_name.c_str());
+        status != LUA_OK) {
+        return status;
+    }
+    return lua_pcall(L, 0, LUA_MULTRET, 0);
+}
+
 } // namespace
 
 std::optional<LoadError> load_config(const Path& script_path, config::ProjectConfig& out) {
@@ -505,7 +549,7 @@ std::optional<LoadError> load_config(const Path& script_path, config::ProjectCon
 
     register_api(L);
 
-    if (const int status = luaL_dofile(L, fs::to_native(script_path).c_str()); status != LUA_OK) {
+    if (const int status = run_script(L, script_path); status != LUA_OK) {
         LoadError error{lua_tostring(L, -1)};
         lua_close(L);
         return error;

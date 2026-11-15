@@ -119,7 +119,7 @@ void parse(const std::string& text, bool journal, std::unordered_map<std::string
 }
 
 std::string read_file(const Path& path) {
-    std::ifstream in(fs::to_native(path), std::ios::binary);
+    std::ifstream in(fs::to_fs_path(path), std::ios::binary);
     if (!in) {
         return {};
     }
@@ -162,7 +162,7 @@ void CacheStore::invalidate(const graph::TaskId& id) {
 bool CacheStore::begin_journal() {
     fs::create_directories(cache_dir_);
     journal_ = std::make_unique<std::ofstream>(
-        fs::to_native(journal_path_), std::ios::binary | std::ios::app);
+        fs::to_fs_path(journal_path_), std::ios::binary | std::ios::app);
     if (!*journal_) {
         journal_.reset();
         return false;
@@ -184,7 +184,7 @@ bool CacheStore::save() {
 
     const Path temp_path = manifest_path_ + ".tmp";
     {
-        std::ofstream out(fs::to_native(temp_path), std::ios::binary | std::ios::trunc);
+        std::ofstream out(fs::to_fs_path(temp_path), std::ios::binary | std::ios::trunc);
         if (!out) {
             return false;
         }
@@ -198,7 +198,7 @@ bool CacheStore::save() {
     }
 
     std::error_code ec;
-    std::filesystem::rename(fs::to_native(temp_path), fs::to_native(manifest_path_), ec);
+    std::filesystem::rename(fs::to_fs_path(temp_path), fs::to_fs_path(manifest_path_), ec);
     if (ec) {
         return false;
     }
@@ -206,7 +206,7 @@ bool CacheStore::save() {
     // Everything in the journal is now part of the manifest. Replaying the
     // journal again (if we die before removing it) is harmless.
     journal_.reset();
-    std::filesystem::remove(fs::to_native(journal_path_), ec);
+    std::filesystem::remove(fs::to_fs_path(journal_path_), ec);
     return true;
 }
 

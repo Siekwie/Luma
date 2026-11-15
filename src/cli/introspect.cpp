@@ -52,7 +52,7 @@ bool write_file_atomically(const Path& path, const std::string& content, std::st
     fs::create_directories(fs::parent(path));
     const Path temp = path + ".tmp";
     {
-        std::ofstream out(fs::to_native(temp), std::ios::binary | std::ios::trunc);
+        std::ofstream out(fs::to_fs_path(temp), std::ios::binary | std::ios::trunc);
         if (!out) {
             error = "cannot write " + temp;
             return false;
@@ -64,17 +64,17 @@ bool write_file_atomically(const Path& path, const std::string& content, std::st
         }
     }
     std::error_code ec;
-    std::filesystem::rename(fs::to_native(temp), fs::to_native(path), ec);
+    std::filesystem::rename(fs::to_fs_path(temp), fs::to_fs_path(path), ec);
     if (ec) {
         error = "cannot replace " + path + ": " + ec.message();
-        std::filesystem::remove(fs::to_native(temp), ec);
+        std::filesystem::remove(fs::to_fs_path(temp), ec);
         return false;
     }
     return true;
 }
 
 std::string read_file(const Path& path) {
-    std::ifstream in(fs::to_native(path), std::ios::binary);
+    std::ifstream in(fs::to_fs_path(path), std::ios::binary);
     if (!in) {
         return {};
     }

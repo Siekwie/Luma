@@ -184,10 +184,15 @@ std::vector<std::string> gnu_compile_command(
 
 std::vector<std::string> msvc_compile_command(
     const ToolchainDef& toolchain, const CompileInputs& in, const Path& root) {
+    // /TC and /TP force the language: cl.exe only knows .c/.cpp/.cxx/.cc and
+    // would hand e.g. "x.c++" or "x.cp" to the linker instead of compiling it.
     std::vector<std::string> cmd = {
         in.language == SourceLanguage::C ? toolchain.cc : toolchain.cxx, "/nologo", "/showIncludes", "/c"};
     if (in.language == SourceLanguage::Cxx) {
+        cmd.push_back("/TP");
         cmd.push_back("/EHsc");
+    } else {
+        cmd.push_back("/TC");
     }
     append(cmd, in.flags);
     for (const auto& define : in.defines) {

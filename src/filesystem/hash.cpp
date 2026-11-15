@@ -9,7 +9,7 @@
 namespace luma::fs {
 
 std::optional<Hash> hash_file(const Path& path) {
-    std::ifstream file(to_native(path), std::ios::binary);
+    std::ifstream file(to_fs_path(path), std::ios::binary);
     if (!file) {
         return std::nullopt;
     }

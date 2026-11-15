@@ -38,6 +38,12 @@ add_executable(luma
 )
 target_link_libraries(luma PRIVATE luma_core)
 target_compile_definitions(luma PRIVATE LUMA_VERSION="${PROJECT_VERSION}")
+if(WIN32)
+    # CommandLineToArgvW (UTF-8 argv in src/cli/main.cpp).
+    target_link_libraries(luma PRIVATE shell32)
+    # <windows.h> must not define min()/max() macros over std::min/std::max.
+    target_compile_definitions(luma_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(luma_core PUBLIC Threads::Threads)

@@ -47,6 +47,36 @@ std::atomic<bool> g_cancelled{false};
 std::atomic<int> g_cancel_signal{0};
 
 #ifdef _WIN32
+/// UTF-8 -> UTF-16. Arguments, paths and the working directory are UTF-8
+/// throughout luma; the narrow (-A) Win32 APIs would reinterpret them in the
+/// ANSI code page, so processes are created with the wide (-W) APIs.
+std::wstring widen(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) {
+        return std::wstring(text.begin(), text.end());
+    }
+    std::wstring out(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size);
+    return out;
+}
+
+std::string narrow(const wchar_t* text, std::size_t length) {
+    if (length == 0) {
+        return {};
+    }
+    const int size =
+        WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string out(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), out.data(), size, nullptr, nullptr);
+    return out;
+}
+
 /// Quote one argument following the MSVC runtime's CommandLineToArgvW rules.
 std::string quote_arg(const std::string& arg) {
     if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string::npos) {
@@ -88,16 +118,16 @@ std::string build_command_line(const std::vector<std::string>& command) {
 
 std::string last_error_message() {
     const DWORD code = GetLastError();
-    char* buffer = nullptr;
-    const DWORD size = FormatMessageA(
+    wchar_t* buffer = nullptr;
+    const DWORD size = FormatMessageW(
         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr,
         code,
         0,
-        reinterpret_cast<LPSTR>(&buffer),
+        reinterpret_cast<LPWSTR>(&buffer),
         0,
         nullptr);
-    std::string message = size && buffer ? std::string(buffer, size) : "error " + std::to_string(code);
+    std::string message = size && buffer ? narrow(buffer, size) : "error " + std::to_string(code);
     if (buffer) {
         LocalFree(buffer);
     }
@@ -122,7 +152,7 @@ std::string drain_handle(HANDLE pipe) {
 /// when luma exits for any reason, including TerminateProcess) kills them.
 HANDLE child_job() {
     static HANDLE job = []() -> HANDLE {
-        HANDLE handle = CreateJobObjectA(nullptr, nullptr);
+        HANDLE handle = CreateJobObjectW(nullptr, nullptr);
         if (!handle) {
             return nullptr;
         }
@@ -337,24 +367,22 @@ ProcessResult run_process(
             }
             SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
         }
-        null_input = CreateFileA(
-            "NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+        null_input = CreateFileW(
+            L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
 
-        STARTUPINFOA si{};
+        STARTUPINFOW si{};
         si.cb = sizeof(si);
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput = stdout_write;
         si.hStdError = merge_output ? stdout_write : stderr_write;
         si.hStdInput = null_input;
 
-        const std::string command_line = build_command_line(command);
-        std::vector<char> mutable_command_line(command_line.begin(), command_line.end());
-        mutable_command_line.push_back('\0');
-
-        const std::string cwd = working_directory.empty() ? std::string{} : fs::to_native(working_directory);
-        created = CreateProcessA(
+        // CreateProcessW may modify the command line buffer in place.
+        std::wstring command_line = widen(build_command_line(command));
+        const std::wstring cwd = working_directory.empty() ? std::wstring{} : widen(fs::to_native(working_directory));
+        created = CreateProcessW(
             nullptr,
-            mutable_command_line.data(),
+            command_line.data(),
             nullptr,
             nullptr,
             TRUE,
@@ -510,7 +538,7 @@ int run_process_interactive(
     {
         std::lock_guard lock(spawn_mutex());
 
-        STARTUPINFOA si{};
+        STARTUPINFOW si{};
         si.cb = sizeof(si);
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
@@ -522,14 +550,12 @@ int run_process_interactive(
             }
         }
 
-        const std::string command_line = build_command_line(command);
-        std::vector<char> mutable_command_line(command_line.begin(), command_line.end());
-        mutable_command_line.push_back('\0');
-        const std::string cwd = working_directory.empty() ? std::string{} : fs::to_native(working_directory);
+        std::wstring command_line = widen(build_command_line(command));
+        const std::wstring cwd = working_directory.empty() ? std::wstring{} : widen(fs::to_native(working_directory));
 
-        created = CreateProcessA(
+        created = CreateProcessW(
             nullptr,
-            mutable_command_line.data(),
+            command_line.data(),
             nullptr,
             nullptr,
             TRUE,

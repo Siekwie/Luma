@@ -53,6 +53,13 @@ ToolchainDef make_msvc() {
 } // namespace
 
 config::ToolchainDef detect_default() {
+#ifdef _WIN32
+    // In a Visual Studio developer prompt cl.exe is the intended compiler,
+    // even when a MinGW g++ or an LLVM clang++ also happens to be on PATH.
+    if (command_available("cl")) {
+        return make_msvc();
+    }
+#endif
     if (command_available("clang++")) {
         return make_gnu("clang++", "clang");
     }
